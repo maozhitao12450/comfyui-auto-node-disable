@@ -116,18 +116,23 @@ custom_nodes/<module_name> → 它注册的节点类集合
 
 ### 6. 状态文件位置
 
-默认放在 ComfyUI 根目录下：
+默认放在 **插件目录** 内（与 `auto_disable.py` 同目录）：
 
 ```
 ComfyUI/
-├── auto_node_disable_state.json   ← 插件的状态文件
 ├── custom_nodes/
 │   ├── comfyui-auto-node-disable/
+│   │   ├── auto_disable.py
+│   │   └── auto_node_disable_state.json    ← 插件的状态文件（与代码同目录）
 │   ├── ComfyUI-Manager/
-│   ├── .disabled/                  ← 已被自动禁用的模块暂存区
+│   ├── .disabled/                          ← 已被自动禁用的模块暂存区
 │   │   └── <module_name>/
 │   └── ...
 ```
+
+> 旧版（v0.x 及更早）状态文件位于 `ComfyUI/auto_node_disable_state.json`。
+> 升级后第一次启动会自动迁移到该位置（`os.replace` 原子重命名）。如果新旧文件同时存在，以新为准。
+> 如需手动清理，删除旧位置的 `auto_node_disable_state.json` 即可。
 
 ---
 
@@ -169,7 +174,7 @@ curl -X POST http://localhost:8188/auto_disable/restore \
 
 ### 通过状态文件手动编辑
 
-直接编辑 `ComfyUI/auto_node_disable_state.json`：
+直接编辑 `custom_nodes/comfyui-auto-node-disable/auto_node_disable_state.json`：
 
 ```json
 {

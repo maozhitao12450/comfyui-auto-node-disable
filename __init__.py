@@ -11,8 +11,9 @@ ComfyUI Auto Node Disable
    如果某个 custom_node 模块所提供的节点类型在最近 ``threshold`` 次
    入队中都未出现，就把它整体移动到 ``custom_nodes/.disabled/<原名>/``
    子目录里；
-3. 阈值和排除列表可持久化到 ComfyUI 根目录下的
-   ``auto_node_disable_state.json`` 文件。
+3. 阈值和排除列表可持久化到插件目录下的
+   ``auto_node_disable_state.json`` 文件（与本文件同目录；
+   旧版本位于 ComfyUI 根目录，升级后首次启动会自动迁移）。
 
 需要重启 ComfyUI 才会真正卸载已被禁用的模块（节点注册发生在启动阶段）。
 

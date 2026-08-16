@@ -26,6 +26,8 @@
   4. 窗口修剪（rounds 超 keep*4 时被截断）
   5. 缺失节点自动恢复（submit 引用未注册类 → .disabled 匹配 → 原子恢复 →
      pending_restart 提示与消费；含拒绝/忽略/原子化等边界）
+  4b. 启动对账（_reconcile_disabled_with_disk 四种场景 + 类名扫描失败容错）
+  4c. 状态文件位置迁移（ComfyUI 根目录 → 插件目录，兼容旧位置）
 
 并补全了产品当前实现的额外安全边界：
   - dry-run 干跑模式
@@ -692,6 +694,120 @@ class StartupReconcileDiskTests(_IsolatedTestBase):
         s_after = auto_disable._load_state()
         self.assertIn("outside_mod", s_after["disabled"])
         self.assertEqual(s_after["disabled"]["outside_mod"]["status"], "confirmed")
+
+
+# ---------------------------------------------------------------------------
+# 4c. 状态文件位置迁移：ComfyUI 根目录 → 插件目录
+# ---------------------------------------------------------------------------
+
+
+class StateLocationMigrationTests(unittest.TestCase):
+    """状态文件从 ``ComfyUI/auto_node_disable_state.json`` 迁到插件目录内。
+
+    不复用 ``_IsolatedTestBase``，因为它会把 ``_comfy_root`` 打桩到 ``tmpdir``，
+    使 legacy 与 new 路径退化为同一路径，无法验证迁移。
+    本类手动将 ``_comfy_root`` 与 ``_state_path`` 指向不同子目录。
+    """
+
+    def setUp(self) -> None:
+        self.tmpdir = tempfile.mkdtemp(prefix="auto_disable_migrate_")
+        # 旧位置：ComfyUI 根目录
+        self.legacy_root = os.path.join(self.tmpdir, "ComfyUI_old")
+        self.legacy_path = os.path.join(
+            self.legacy_root, "auto_node_disable_state.json"
+        )
+        # 新位置：插件目录（与 auto_disable.py 同目录）
+        self.plugin_dir = os.path.join(self.tmpdir, "plugin")
+        self.new_path = os.path.join(
+            self.plugin_dir, "auto_node_disable_state.json"
+        )
+        os.makedirs(self.legacy_root, exist_ok=True)
+        os.makedirs(self.plugin_dir, exist_ok=True)
+
+        self._patches = [
+            mock.patch.object(
+                auto_disable, "_comfy_root", return_value=self.legacy_root
+            ),
+            mock.patch.object(
+                auto_disable, "_state_path", return_value=self.new_path
+            ),
+        ]
+        for p in self._patches:
+            p.start()
+
+    def tearDown(self) -> None:
+        for p in self._patches:
+            p.stop()
+        shutil.rmtree(self.tmpdir, ignore_errors=True)
+
+    def _write_legacy(self, payload: dict) -> None:
+        with open(self.legacy_path, "w", encoding="utf-8") as f:
+            json.dump(payload, f)
+
+    def test_legacy_is_moved_to_plugin_dir(self):
+        """旧位置存在且新位置不存在时，迁移后旧文件消失、新文件出现。"""
+        self._write_legacy({"threshold": 7, "note": "from legacy"})
+        self.assertTrue(os.path.exists(self.legacy_path))
+        self.assertFalse(os.path.exists(self.new_path))
+
+        auto_disable._migrate_legacy_state()
+
+        self.assertFalse(os.path.exists(self.legacy_path))
+        self.assertTrue(os.path.exists(self.new_path))
+        with open(self.new_path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        self.assertEqual(data["threshold"], 7)
+        self.assertEqual(data["note"], "from legacy")
+
+    def test_legacy_kept_when_new_already_exists(self):
+        """新旧都存在时，新为准；旧文件保留并告警（不覆盖新文件）。"""
+        self._write_legacy({"threshold": 1, "winner": "legacy"})
+        new_payload = {"threshold": 9, "winner": "new"}
+        with open(self.new_path, "w", encoding="utf-8") as f:
+            json.dump(new_payload, f)
+
+        auto_disable._migrate_legacy_state()
+
+        # 两份都保留
+        self.assertTrue(os.path.exists(self.legacy_path))
+        self.assertTrue(os.path.exists(self.new_path))
+        with open(self.new_path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        self.assertEqual(data["winner"], "new")
+        self.assertEqual(data["threshold"], 9)
+
+    def test_no_op_when_legacy_missing(self):
+        """旧位置不存在时，迁移是 no-op（不创建新文件）。"""
+        self.assertFalse(os.path.exists(self.legacy_path))
+
+        auto_disable._migrate_legacy_state()
+
+        self.assertFalse(os.path.exists(self.new_path))
+
+    def test_load_state_triggers_migration(self):
+        """``_load_state`` 调用时自动迁移旧位置 -> 插件目录。"""
+        self._write_legacy({"threshold": 11})
+
+        loaded = auto_disable._load_state()
+
+        # 旧文件应被搬走
+        self.assertFalse(os.path.exists(self.legacy_path))
+        # 新文件应存在
+        self.assertTrue(os.path.exists(self.new_path))
+        # 加载时应能读到旧配置
+        self.assertEqual(loaded["threshold"], 11)
+
+    def test_legacy_path_is_comfy_root_state(self):
+        """验证 ``_legacy_state_path`` 拼出的是 ComfyUI 根目录下的文件名。"""
+        expected = os.path.join(
+            self.legacy_root, auto_disable.STATE_FILENAME
+        )
+        self.assertEqual(auto_disable._legacy_state_path(), expected)
+
+    def test_state_path_is_plugin_dir_state(self):
+        """验证 ``_state_path`` 拼出的是插件目录下的文件名。"""
+        expected = os.path.join(self.plugin_dir, auto_disable.STATE_FILENAME)
+        self.assertEqual(auto_disable._state_path(), expected)
 
 
 # ---------------------------------------------------------------------------

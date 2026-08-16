@@ -11,7 +11,8 @@ auto_disable.py
   ``RELATIVE_PYTHON_MODULE`` 属性，反向构建
   ``custom_node 子目录名 -> 它提供的节点类名集合`` 的映射。
 - 每次有工作流入队（``prompt`` API），都从 prompt 中提取本次用到的节点类
-  并写入一份滚动状态文件（默认放在 ComfyUI 根目录下 ``auto_node_disable_state.json``）。
+  并写入一份滚动状态文件（默认放在插件目录内 ``auto_node_disable_state.json``，
+  与本文件同目录；旧版本位于 ComfyUI 根目录，首次启动会自动迁移）。
 - 当滚动窗口内连续 ``threshold``（默认 3）次入队都未出现某 custom_node 的节点类时，
   将该 custom_node 目录移动到 ``custom_nodes/.disabled/<原名>/`` 下。
 - 用户可在状态文件里通过 ``exclude`` 列表永久保留某些 custom_node 不被自动禁用。
@@ -57,7 +58,7 @@ log = logging.getLogger("auto_node_disable")
 # 路径常量
 # ---------------------------------------------------------------------------
 
-# 状态文件名（保存到 ComfyUI 根目录，即 main.py 所在目录的上一层）
+# 状态文件名（保存在插件目录内，与代码同目录，便于跟插件一起分发/迁移）
 STATE_FILENAME = "auto_node_disable_state.json"
 
 # 禁用目录名（位于 custom_nodes/ 下）
@@ -98,8 +99,62 @@ def _comfy_root() -> str:
     return os.path.dirname(_custom_nodes_dir())
 
 
+def _plugin_dir() -> str:
+    """本插件所在目录（即 ``auto_disable.py`` 所在目录）。"""
+    return os.path.dirname(os.path.abspath(__file__))
+
+
 def _state_path() -> str:
+    """当前状态文件路径：与插件代码同目录。
+
+    之前版本写在 ``ComfyUI/auto_node_disable_state.json``（ComfyUI 根目录），
+    现改为插件目录内（旧位置会在启动时自动迁移）。
+    """
+    return os.path.join(_plugin_dir(), STATE_FILENAME)
+
+
+def _legacy_state_path() -> str:
+    """旧版状态文件位置：ComfyUI 根目录（``custom_nodes`` 的父目录）。"""
     return os.path.join(_comfy_root(), STATE_FILENAME)
+
+
+def _migrate_legacy_state() -> None:
+    """把旧位置的 ``auto_node_disable_state.json`` 迁移到插件目录内。
+
+    规则：
+    - 旧文件不存在：no-op
+    - 新文件已存在：以新为准，旧文件留待用户自行清理并告警
+    - 同路径（测试 / 插件恰好就装在 ComfyUI 根目录）：no-op
+    - 否则用 ``os.replace`` 原子重命名（同一文件系统则原地瞬移，否则抛错）
+    """
+    legacy = _legacy_state_path()
+    new = _state_path()
+    try:
+        if os.path.abspath(legacy) == os.path.abspath(new):
+            return
+    except Exception:
+        return
+    if not os.path.exists(legacy):
+        return
+    if os.path.exists(new):
+        log.warning(
+            "auto_node_disable: legacy state at %s exists but new state at %s "
+            "already exists; keeping new, please remove the legacy file manually",
+            legacy, new,
+        )
+        return
+    try:
+        os.makedirs(os.path.dirname(new), exist_ok=True)
+        os.replace(legacy, new)
+        log.info(
+            "auto_node_disable: migrated legacy state file %s -> %s",
+            legacy, new,
+        )
+    except Exception as e:
+        log.warning(
+            "auto_node_disable: failed to migrate legacy state from %s to %s: %s",
+            legacy, new, e,
+        )
 
 
 def _disabled_dir() -> str:
@@ -115,6 +170,8 @@ _state_lock = threading.RLock()
 
 def _load_state() -> dict[str, Any]:
     """读取状态文件；不存在则返回默认结构。"""
+    # 启动时把旧位置（ComfyUI 根目录）的状态文件迁移到插件目录内
+    _migrate_legacy_state()
     path = _state_path()
     if not os.path.exists(path):
         return _default_state()
