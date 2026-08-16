@@ -20,6 +20,13 @@
  *   POST /auto_disable/restore   {"module": "<name>"}
  *   POST /auto_disable/threshold {"value": <int>}
  *   POST /auto_disable/exclude   {"names": ["..."]}
+ *   POST /auto_disable/pending_restart   取走并清空 待重启 提示列表
+ *
+ * 自动恢复流程：
+ *   1. 提交工作流时若发现某个 class_type 在当前 NODE_CLASS_MAPPINGS 中缺失，
+ *      后端去 .disabled 找能提供该类的模块并自动移回 custom_nodes。
+ *   2. 这次恢复会写入 state.pending_restart，前端在 prompt 响应后调用
+ *      pending_restart 端点拉取并弹 请重启 ComfyUI 提示。
  */
 
 import { app } from "../../../scripts/app.js";
@@ -224,8 +231,76 @@ function attachTopButton() {
 }
 
 // ---------------------------------------------------------------------------
+// 自动重启提示：拦截 api.queuePrompt，提交后拉取待重启条目并弹窗
+// ---------------------------------------------------------------------------
+
+function showRestartNotice(items) {
+    if (!items || items.length === 0) {
+        return;
+    }
+    const names = items.map((it) => it.module).join(", ");
+    const summary =
+        `检测到缺失节点，已从 .disabled/ 自动恢复 ${items.length} 个模块：\n` +
+        `${names}\n\n请重启 ComfyUI 后这些节点才会被加载生效。`;
+    // 使用浏览器原生 alert 足够可靠；后续可换成 ComfyUI 自己的 toast / dialog
+    // eslint-disable-next-line no-alert
+    if (typeof window !== "undefined" && typeof window.alert === "function") {
+        window.alert(summary);
+    } else {
+        console.warn("[auto_disable] pending restart:", items);
+    }
+}
+
+async function consumePendingRestart() {
+    try {
+        const r = await api.fetchApi(`${ENDPOINT}/pending_restart`, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({}),
+        });
+        if (!r || !r.ok) {
+            return [];
+        }
+        const data = await r.json();
+        return Array.isArray(data?.items) ? data.items : [];
+    } catch (e) {
+        console.warn("[auto_disable] pending_restart fetch failed:", e);
+        return [];
+    }
+}
+
+function wrapQueuePrompt() {
+    // 只包一次，避免重复包装
+    if (api.__auto_disable_wrapped__) {
+        return;
+    }
+    const orig = api.queuePrompt;
+    if (typeof orig !== "function") {
+        return;
+    }
+    api.queuePrompt = async function patchedQueuePrompt(...args) {
+        let result;
+        try {
+            result = await orig.apply(this, args);
+        } catch (e) {
+            // 即便提交失败也尝试消费待重启条目（避免堆积）
+            throw e;
+        } finally {
+            // 不论成功失败都消费一次 pending_restart，保证状态收敛
+            consumePendingRestart()
+                .then((items) => showRestartNotice(items))
+                .catch(() => {});
+        }
+        return result;
+    };
+    api.__auto_disable_wrapped__ = true;
+}
+
+
+// ---------------------------------------------------------------------------
 // ComfyUI 扩展注册
 // ---------------------------------------------------------------------------
+
 
 app.registerExtension({
     name: "auto_node_disable",
@@ -275,6 +350,8 @@ app.registerExtension({
     ],
 
     async setup() {
+        // 包装 api.queuePrompt，使得每次提交后能拿到后端的 pending_restart 提示
+        wrapQueuePrompt();
         // 等 UI 主体渲染完成后再挂顶栏按钮（部分主题懒渲染）
         const tryAttach = () => attachTopButton();
         setTimeout(tryAttach, 500);

@@ -16,6 +16,13 @@ auto_disable.py
   将该 custom_node 目录移动到 ``custom_nodes/.disabled/<原名>/`` 下。
 - 用户可在状态文件里通过 ``exclude`` 列表永久保留某些 custom_node 不被自动禁用。
 
+反向能力：自动恢复
+------------------
+当用户提交的工作流引用了**当前未注册的节点类**（多半是被自动禁用导致），
+会去 ``.disabled/`` 里寻找能提供这些类名的模块并自动移回
+``custom_nodes/``，同时把"待重启"条目写入 ``state["pending_restart"]``，
+由前端在下次 ``/auto_disable/status`` 拉取时弹出"请重启 ComfyUI"提示。
+
 安全边界
 --------
 为防止"目录已移动但状态未落盘"或"重复入队造成误禁用"造成的不可恢复副作用，
@@ -55,7 +62,7 @@ STATE_FILENAME = "auto_node_disable_state.json"
 # 禁用目录名（位于 custom_nodes/ 下）
 DISABLED_DIR_NAME = ".disabled"
 
-# 每次『打开页面』= 一次 prompt 入队；阈值默认 3 次
+# 每次『打开页面』= 一次 prompt 入队；阈值默认 30 次
 DEFAULT_THRESHOLD = 30
 
 # 默认排除列表：永不自动禁用的 custom_node 子目录名
@@ -120,6 +127,9 @@ def _load_state() -> dict[str, Any]:
     defaults = _default_state()
     for k, v in defaults.items():
         data.setdefault(k, v)
+    # pending_restart 必须是 list；旧版本不存在该字段时已被 setdefault 填充为 []
+    if not isinstance(data.get("pending_restart"), list):
+        data["pending_restart"] = []
     # 启动时对齐 pending 与目录实际位置（进程崩溃后恢复用）
     if _reconcile_pending(data):
         try:
@@ -180,7 +190,13 @@ def _default_state() -> dict[str, Any]:
         "rounds": [],         # 滚动窗口：每条 {"timestamp": float, "used_classes": [...], "prompt_id"?: str}
         "disabled": {},       # module_name -> {"original_path": "...", "disabled_at": float,
                               #                     "prompt_id"?: str,
+                              #                     "node_classes"?: [...],
                               #                     "status": "pending"|"confirmed"|"dry_run"}
+        # 因提交工作流命中了 .disabled 里某模块而自动恢复时记录在这里，
+        # 前端轮询 /auto_disable/status 消费后清空，提示用户重启 ComfyUI。
+        # 每条: {"module": str, "node_classes": [...], "restored_at": float,
+        #         "prompt_id"?: str}
+        "pending_restart": [],
     }
 
 
@@ -266,7 +282,9 @@ def _resolve_module_path(module_name: str) -> str:
 # 记录一次『页面打开』事件（即一次 prompt 入队）
 # ---------------------------------------------------------------------------
 
-def record_prompt(prompt_or_json: Any, prompt_id: Optional[str] = None) -> None:
+def record_prompt(
+    prompt_or_json: Any, prompt_id: Optional[str] = None
+) -> dict[str, Any]:
     """记录一次 prompt 入队事件，叠加到滚动窗口；并触发决策。
 
     :param prompt_or_json: 可以是 ComfyUI ``/prompt`` 请求体
@@ -276,6 +294,8 @@ def record_prompt(prompt_or_json: Any, prompt_id: Optional[str] = None) -> None:
         会被写入 ``rounds`` 条目，并在该轮触发禁用时进入 ``disabled`` 记录，
         用于事后审计"哪个入队导致哪个目录被禁用"。如果 ``prompt_or_json``
         是 dict 且包含 ``prompt_id`` 字段，则优先采用字段值。
+    :return: 本次入队后的进度摘要，字段包括 ``rounds_count`` / ``threshold`` /
+        ``keep`` / ``dry_run``，供调用方在日志/遥测里使用。
     """
     # 兼容两种输入：dict (原始请求体) 或可迭代对象 (已提取的类名集合)
     if isinstance(prompt_or_json, dict):
@@ -295,6 +315,16 @@ def record_prompt(prompt_or_json: Any, prompt_id: Optional[str] = None) -> None:
         _scan_known_modules(state)
 
         used = sorted(set(used_class_names))
+
+        # 1) 缺失节点类自动恢复：在写入本轮 round 之前尝试把已禁用的
+        #    能提供本次所需类名的模块移回 custom_nodes/。
+        #    若有命中，会把待重启条目写入 state["pending_restart"]，
+        #    前端在 prompt 响应后再发起一次 /auto_disable/status 拉取即可拿到。
+        try:
+            restore_for_missing_classes(state, used, prompt_id=prompt_id)
+        except Exception as e:
+            log.warning("auto_node_disable: auto-restore step failed: %s", e)
+
         round_entry: dict[str, Any] = {"timestamp": time.time(), "used_classes": used}
         if prompt_id is not None:
             round_entry["prompt_id"] = prompt_id
@@ -314,6 +344,14 @@ def record_prompt(prompt_or_json: Any, prompt_id: Optional[str] = None) -> None:
             log.warning("auto_node_disable: decision step failed: %s", e)
         else:
             _save_state(state)
+
+        # 返回本次入队后的进度摘要，供调用方记录到日志/遥测。
+        return {
+            "rounds_count": len(state["rounds"]),
+            "threshold": int(state.get("threshold", DEFAULT_THRESHOLD)),
+            "keep": keep,
+            "dry_run": bool(state.get("dry_run", False)),
+        }
 
 
 # ---------------------------------------------------------------------------
@@ -379,6 +417,7 @@ def _decide(
                 "original_path": info.get("module_path", ""),
                 "disabled_at": time.time(),
                 "prompt_id": last_prompt_id,
+                "node_classes": sorted(node_classes),
                 "status": "dry_run",
             }
             newly.append(module_name)
@@ -393,6 +432,7 @@ def _decide(
             "original_path": info.get("module_path", ""),
             "disabled_at": time.time(),
             "prompt_id": last_prompt_id,
+            "node_classes": sorted(node_classes),
             "status": "pending",
         }
         disabled[module_name] = pending_record
@@ -482,48 +522,202 @@ def _disable_module(module_name: str, info: dict[str, Any]) -> bool:
 # ---------------------------------------------------------------------------
 
 def restore_module(module_name: str) -> bool:
-    """把 ``.disabled/<module_name>`` 移回 ``custom_nodes/<module_name>``。"""
+    """把 ``.disabled/<module_name>`` 移回 ``custom_nodes/<module_name>``。
+
+    外层负责获取状态锁；真正的物理移动与状态清理交给
+    ``_restore_disabled_module_unsafe``，便于下面的自动恢复路径复用同一份代码。
+    """
     with _state_lock:
         state = _load_state()
-        disabled = state.get("disabled", {}) or {}
-        info = disabled.get(module_name)
-        if not info:
-            # 尝试直接定位
-            candidate = os.path.join(_disabled_dir(), module_name)
-            if not os.path.exists(candidate):
-                log.info("auto_node_disable: %s is not currently disabled", module_name)
-                return False
-            target_src = candidate
-        else:
-            target_src = info.get("original_path") or os.path.join(
-                _disabled_dir(), module_name
-            )
-            if not os.path.exists(target_src):
-                target_src = os.path.join(_disabled_dir(), module_name)
-            if not os.path.exists(target_src):
-                log.info(
-                    "auto_node_disable: cannot find disabled module at %s", target_src
-                )
-                return False
+        return _restore_disabled_module_unsafe(state, module_name)
 
-        dst = os.path.join(_custom_nodes_dir(), module_name)
-        if os.path.exists(dst):
+
+def _restore_disabled_module_unsafe(state: dict[str, Any], module_name: str) -> bool:
+    """``restore_module`` 的核心实现。**调用方必须已持有 ``_state_lock``**。
+
+    把 ``.disabled/<module_name>`` 移回 ``custom_nodes/<module_name>``，
+    并从 ``state["disabled"]`` 中清理该条目。返回是否成功。
+
+    出现任意错误（例如目标位置已被占用、移动失败等）都会返回 False，
+    并保留 ``state["disabled"]`` 原样，以便用户手动恢复或重试。
+    """
+    disabled = state.get("disabled", {}) or {}
+    info = disabled.get(module_name)
+    if not info:
+        # 尝试直接定位
+        candidate = os.path.join(_disabled_dir(), module_name)
+        if not os.path.exists(candidate):
+            log.info("auto_node_disable: %s is not currently disabled", module_name)
+            return False
+        target_src = candidate
+    else:
+        target_src = info.get("original_path") or os.path.join(
+            _disabled_dir(), module_name
+        )
+        if not os.path.exists(target_src):
+            target_src = os.path.join(_disabled_dir(), module_name)
+        if not os.path.exists(target_src):
+            log.info(
+                "auto_node_disable: cannot find disabled module at %s", target_src
+            )
+            return False
+
+    dst = os.path.join(_custom_nodes_dir(), module_name)
+    if os.path.exists(dst):
+        log.warning(
+            "auto_node_disable: destination %s already exists; aborting restore",
+            dst,
+        )
+        return False
+
+    try:
+        shutil.move(target_src, dst)
+    except Exception as e:
+        log.warning("auto_node_disable: failed to restore %s: %s", target_src, e)
+        return False
+
+    disabled.pop(module_name, None)
+    _save_state(state)
+    log.info("auto_node_disable: restored %s -> %s", target_src, dst)
+    return True
+
+
+# ---------------------------------------------------------------------------
+# 缺失节点类自动恢复：扫描 .disabled/ 里能提供这些类名的模块并恢复
+# ---------------------------------------------------------------------------
+
+def _current_registered_classes() -> Optional[set[str]]:
+    """返回当前 ComfyUI 进程里实际注册过的节点类名集合。
+
+    - 返回 ``None`` 表示“未知”（=无法导入 ``nodes`` 模块或映射不可用），
+      调用方应保守地不做任何恢复。
+    - 返回 ``set``（可能为空）表示已知集合；若为空说明进程里没有任何节点
+      类被注册，本次用到的任何 class 都属于“缺失”。
+    仅取 key 名称，不实际触发任何节点加载。
+    """
+    try:
+        import nodes  # ComfyUI 全局
+        mapping = getattr(nodes, "NODE_CLASS_MAPPINGS", None)
+        if not isinstance(mapping, dict):
+            return None
+        return {str(k) for k in mapping.keys() if k}
+    except Exception:
+        return None
+
+
+def restore_for_missing_classes(
+    state: dict[str, Any],
+    used_classes: Iterable[str],
+    prompt_id: Optional[str] = None,
+) -> list[str]:
+    """本次入队用了某些节点类，如果它们当前**未被注册**，就去 ``.disabled/`` 里
+    找匹配模块恢复；返回恢复的模块名列表（用于追加到 ``pending_restart``）。
+
+    设计要点
+    --------
+
+    1. 通过 ``_current_registered_classes`` 拿到当前进程真实注册过的类集合；
+       用 ``used_classes - registered`` 得到“缺失”类。
+    2. 遍历 ``state["disabled"]`` 里所有 ``status="confirmed"`` 的模块，按其
+       ``node_classes`` 与缺失类做交集；只要命中就触发原子恢复（复用
+       ``_restore_disabled_module_unsafe`` 的三步流程）。
+    3. 一个缺失类只能匹配到一个模块（第一个命中即消费该类，避免同一模块被
+       多轮恢复；其他类继续向下找）。
+    4. 不修改 ``rounds`` 与 ``used_union``：恢复操作不应该反过来触发自动禁用。
+    5. 若 ``nodes`` 模块导入失败（=拿不到 registered 集合），直接返回空，
+       不做任何恢复，避免误操作。
+
+    **调用方必须已持有 ``_state_lock``**。
+    """
+    used_set = {c for c in (used_classes or []) if isinstance(c, str) and c}
+    if not used_set:
+        return []
+
+    registered = _current_registered_classes()
+    if registered is None:
+        # “未知”状态：无法判断哪些类是真“缺失”，保守地不做任何恢复
+        return []
+
+    missing = used_set - registered
+    if not missing:
+        return []
+
+    disabled: dict[str, Any] = state.get("disabled") or {}
+    if not disabled:
+        return []
+
+    restored: list[str] = []
+    pending_restart: list[dict[str, Any]] = list(state.get("pending_restart") or [])
+
+    # 复制 keys 后再迭代，避免恢复过程中字典被修改
+    for module_name, info in list(disabled.items()):
+        if not isinstance(info, dict):
+            continue
+        # 只考虑已确认被禁用的（confirmed）；pending / dry_run 不在文件系统上，
+        # 无需也无法物理恢复
+        if info.get("status") != "confirmed":
+            continue
+        node_classes = set(info.get("node_classes") or [])
+        if not node_classes:
+            # 历史记录里没有 node_classes（旧版本写入的），跳过以免误伤
+            continue
+        hit = node_classes & missing
+        if not hit:
+            continue
+
+        # 命中：尝试原子恢复。失败也不抛出，让其它候选继续。
+        ok = _restore_disabled_module_unsafe(state, module_name)
+        if not ok:
             log.warning(
-                "auto_node_disable: destination %s already exists; aborting restore",
-                dst,
+                "auto_node_disable: failed to auto-restore %s for missing classes %s",
+                module_name, sorted(hit),
             )
-            return False
+            continue
 
+        restored.append(module_name)
+        # 从 missing 中扣除已恢复覆盖的类，避免被其它模块重复消费
+        missing -= node_classes
+        pending_restart.append({
+            "module": module_name,
+            "node_classes": sorted(node_classes),
+            "restored_at": time.time(),
+            "prompt_id": prompt_id,
+        })
+
+        if not missing:
+            break
+
+    if pending_restart:
+        state["pending_restart"] = pending_restart
+        # 写盘：让前端即便错过实时通知也能在下一次 /status 看到
         try:
-            shutil.move(target_src, dst)
+            _atomic_write_json(_state_path(), state)
         except Exception as e:
-            log.warning("auto_node_disable: failed to restore %s: %s", target_src, e)
-            return False
+            log.warning(
+                "auto_node_disable: failed to persist pending_restart: %s", e,
+            )
 
-        state.get("disabled", {}).pop(module_name, None)
-        _save_state(state)
-        log.info("auto_node_disable: restored %s -> %s", target_src, dst)
-        return True
+    if restored:
+        log.info(
+            "auto_node_disable: auto-restored %d disabled module(s) for missing classes: %s",
+            len(restored), restored,
+        )
+
+    return restored
+
+
+def consume_pending_restart() -> list[dict[str, Any]]:
+    """前端在拿到重启提示后调用本接口消费一次 ``pending_restart``。
+
+    返回当前待提示的条目列表（消费后会被清空）。
+    """
+    with _state_lock:
+        state = _load_state()
+        items = list(state.get("pending_restart") or [])
+        if items:
+            state["pending_restart"] = []
+            _save_state(state)
+        return items
 
 
 def set_threshold(value: int) -> None:

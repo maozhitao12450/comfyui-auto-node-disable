@@ -30,6 +30,7 @@
 - **审计可追溯**：每次入队的 `prompt_id` 透传到 `rounds` 条目；触发禁用的 `disabled` 条目会记录导致它的 `prompt_id`，事后可重建"哪个入队 → 哪个目录被禁用"的因果链。
 - **干跑 (dry-run)**：开启后只写审计字段、不移动目录，便于先观察再放开。
 - **可恢复**：被禁用的模块可通过 `restore_module` / 前端面板一键搬回 `custom_nodes/`。
+- **缺失节点自动恢复**：提交工作流时若发现节点类在当前 `NODE_CLASS_MAPPINGS` 中不存在，会去 `.disabled/` 里查找能提供这些类名的模块并自动搬回 `custom_nodes/`，随后通过状态文件 + 前端弹出"请重启 ComfyUI"提示。
 - **可配置排除名单**：默认始终保留 `comfyui-auto-node-disable`、`ComfyUI-Manager` 等关键扩展，永不自动禁用。
 
 ---
@@ -102,7 +103,18 @@ custom_nodes/<module_name> → 它注册的节点类集合
 - **原路径仍在** → 移动未发生，回滚该记录（避免孤儿状态）；
 - **原路径已不在** → 移动实际成功，升级为 `confirmed`。
 
-### 5. 状态文件位置
+### 5. 反向能力：缺失节点自动恢复
+
+当用户提交了一个工作流，其中包含 `class_type` 在当前 `NODE_CLASS_MAPPINGS` 中**找不到**的节点（多半是被自动禁用导致），插件会：
+
+1. 用当前已注册节点类与工作流用到的节点类做差集，得到 `missing` 集合；
+2. 扫描 `state["disabled"]`（`status == "confirmed"` 的条目）里 `node_classes` 与 `missing` 有交集的模块；
+3. 用与禁用相同的三步原子流程把 `.disabled/<name>/` 搬回 `custom_nodes/<name>/`，写 `pending_restart` 条目；
+4. 搬回成功后，浏览器端在 `api.queuePrompt` 响应后调用 `/auto_disable/pending_restart`，弹窗提示"请重启 ComfyUI"。
+
+> 这一步是在 `_decide` 之前做的：如果刚好一次提交就触发了"恢复 + 再次禁用"的循环，会优先保证被搬回的模块留在原位。
+
+### 6. 状态文件位置
 
 默认放在 ComfyUI 根目录下：
 
@@ -184,6 +196,7 @@ JSON 写入是**原子化**的（先写 `.tmp` 再 `os.replace`），可以安�
 | `POST` | `/auto_disable/restore` | `{"module": "<name>"}` | 把 `.disabled/<name>` 搬回 `custom_nodes/` |
 | `POST` | `/auto_disable/threshold` | `{"value": <int>}` | 调整决策阈值 |
 | `POST` | `/auto_disable/exclude` | `{"names": [...]}` | 更新排除名单 |
+| `POST` | `/auto_disable/pending_restart` | `{}` | 拉取并清空“待重启”提示列表（前端在 `api.queuePrompt` 之后调用） |
 
 ### 前端面板
 
@@ -210,6 +223,15 @@ JSON 写入是**原子化**的（先写 `.tmp` 再 `os.replace`），可以安�
 - 已知 custom_node 模块 JSON 折叠面板（调试用）。
 
 > 浮窗是按需渲染的，首次点击时才拉取 `/auto_disable/status`，不会拖慢启动。
+
+**3) 缺失节点自动恢复后的“请重启”提示**
+
+脚本会一次性 `monkey patch` `api.queuePrompt`：每次提交工作流后异步调用 `/auto_disable/pending_restart`，若返回的列表非空，就调 `alert` 报示：
+
+```
+检测到缺失节点，已从 .disabled/ 自动恢复 N 个模块：module_a, module_b
+请重启 ComfyUI 后这些节点才会被加载生效。
+```
 
 ---
 
@@ -243,12 +265,13 @@ python -m pytest tests/ -v
 python -m unittest tests.test_auto_disable -v
 ```
 
-测试覆盖 4 个用户指定维度：
+测试覆盖 5 个用户指定维度：
 
 1. 阈值判定（含 `threshold=0/-1/1/3` + `exclude` + `dry_run`）
 2. 轮次不足时的行为
 3. 恢复回退（异常路径 + disable/restore roundtrip）
 4. 窗口修剪（`rounds` 超 `keep*4` 时被截断）
+5. 缺失节点自动恢复（submit 引用未注册类 → .disabled 匹配 → 原子恢复 → `pending_restart` 提示与消费；含拒绝/忽略/原子化等边界）
 
 并补全了产品当前实现的额外安全边界：
 
@@ -272,6 +295,18 @@ python verify_hot_path.py
 | 3 | 重复入队只产生一条 confirmed 条目 |
 | 4 | `restore_module` 能把目录搬回并清理状态 |
 | 5 | 启动对齐：遗留 pending 按文件存在与否自动收敛 |
+
+### 独立诊断（scripts/diagnose.py）
+
+```bash
+python scripts/diagnose.py
+```
+
+面向现场的诊断脚本，会依执行**正常 / 恢复 / 失败 / 审计**四个场景，打印中间状态与最终预期，供人与机器两边验证。主要检查：
+
+- `_scan_known_modules` 能反推 `custom_node` 模块名与节点类集合；
+- `rounds<threshold` 时决策对未用模块按全窗口评估（不“等满阈值”）；
+- 状态在恢复、失败、审计三个场景下都不出现孤儿记录。
 
 ### 变更门禁（make gate）
 

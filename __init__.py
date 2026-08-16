@@ -86,13 +86,17 @@ def _on_prompt(json_data: dict[str, Any], *args, **kwargs):
         prompt_id = None
         if isinstance(json_data, dict):
             prompt_id = json_data.get("prompt_id")
-        log.info(
-            "auto_node_disable: recorded prompt %s with %d distinct nodes",
-            prompt_id, len(used),
-        )
         # 透传 prompt_id 以便写入状态文件的审计字段，
         # 事后可重建“哪个入队导致哪个目录被禁用”的因果链。
-        auto_disable.record_prompt(used, prompt_id=prompt_id)
+        summary = auto_disable.record_prompt(used, prompt_id=prompt_id)
+        rounds_count = summary.get("rounds_count", "?") if isinstance(summary, dict) else "?"
+        threshold = summary.get("threshold", "?") if isinstance(summary, dict) else "?"
+        keep = summary.get("keep", "?") if isinstance(summary, dict) else "?"
+        log.info(
+            "auto_node_disable: recorded prompt %s with %d distinct nodes "
+            "(rounds=%s/keep*4=%s, threshold=%s)",
+            prompt_id, len(used), rounds_count, keep, threshold,
+        )
     except Exception as e:
         log.warning("auto_node_disable: on_prompt handler failed: %s", e)
 
@@ -159,6 +163,17 @@ def _register_routes(server) -> None:
             )
         auto_disable.set_exclude([str(n) for n in names])
         return web.json_response({"ok": True})
+
+    @routes.post("/auto_disable/pending_restart")
+    async def _consume_pending_restart(request):
+        """前端在弹出“需重启”提示后调用本接口，领取并清空待提示列表。
+
+        返回值形如 ``{"ok": true, "items": [...]}``；每条 ``item`` 含
+        ``module / node_classes / restored_at / prompt_id`` 字段，
+        前端可据此拼出“已恢复 X 模块”的提示文案。
+        """
+        items = auto_disable.consume_pending_restart()
+        return web.json_response({"ok": True, "items": items})
 
 
 # ---------------------------------------------------------------------------
