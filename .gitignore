@@ -1,0 +1,22 @@
+# Python 字节码与缓存
+__pycache__/
+*.py[cod]
+*.pyo
+
+# ComfyUI 运行时副作用产物（状态文件 + 实际移动的目录）
+auto_node_disable_state.json
+auto_node_disable_state.json.tmp
+custom_nodes/.disabled/
+
+# 工具自身产物：聚焦门禁日志
+tools/check_log.jsonl
+tools/.check_cache/
+
+# 编辑器与系统噪声
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# Qoder/分析副产物（避免把 harness 自己的产物纳入产品仓库）
+.qoder/

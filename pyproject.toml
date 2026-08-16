@@ -1,0 +1,16 @@
+[project]
+name = "comfyui-auto-node-disable"
+description = "Auto-disable ComfyUI custom_node packages that haven't been used in the last N workflow submissions."
+version = "0.1.0"
+license = { text = "MIT" }
+authors = [
+    { name = "zhitao" },
+]
+requires-python = ">=3.9"
+
+[tool.comfy]
+# 告诉 ComfyUI 加载这个扩展时不依赖 pydantic-settings。
+# 把它标为 extension 后 ComfyUI 会调用 __init__.py 并自动加载 web/ 下的 JS。
+PublisherId = "zhitao"
+DisplayName = "ComfyUI Auto Node Disable"
+Icon = ""
