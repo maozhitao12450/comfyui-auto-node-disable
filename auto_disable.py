@@ -131,12 +131,122 @@ def _load_state() -> dict[str, Any]:
     if not isinstance(data.get("pending_restart"), list):
         data["pending_restart"] = []
     # 启动时对齐 pending 与目录实际位置（进程崩溃后恢复用）
-    if _reconcile_pending(data):
+    pending_changed = _reconcile_pending(data)
+    # 启动时对齐 disabled 与 .disabled/ 磁盘：补齐手工禁用、清理被手动恢复的条目
+    disk_result = _reconcile_disabled_with_disk(data)
+    if pending_changed or disk_result["changed"]:
         try:
             _atomic_write_json(path, data)
         except Exception as e:
-            log.warning("auto_node_disable: failed to persist reconciled state: %s", e)
+            log.warning(
+                "auto_node_disable: failed to persist reconciled state: %s", e
+            )
+        if disk_result["added"] or disk_result["restored"]:
+            log.info(
+                "auto_node_disable: reconcile on startup: added=%s, restored=%s, "
+                "warnings=%s",
+                disk_result["added"],
+                disk_result["restored"],
+                disk_result["warnings"],
+            )
     return data
+
+
+def _reconcile_disabled_with_disk(state: dict[str, Any]) -> dict[str, Any]:
+    """把 ``state["disabled"]`` 与 ``.disabled/`` 目录做对账（启动时调用）。
+
+    四种场景：
+
+    1. state 有、磁盘有：正常，保留；顺便把孤悬的 ``pending`` 标记为
+       ``confirmed``（不依赖 ``_reconcile_pending``，保证对账后状态收敛）。
+    2. state 有、磁盘无、且 ``original_path`` 重新可见：视为被用户
+       手动恢复，从 state 里删除。
+    3. state 有、磁盘无、且 ``original_path`` 也看不到：告警并保留
+       （不擅自删除，避免误操作）。
+    4. state 无、磁盘有：当作"被外部禁用"，追加进 state，状态
+       ``confirmed``，``original_path`` 留空（无法可靠反查原始路径）。
+
+    返回 ``{"changed": bool, "added": [...], "restored": [...],
+    "warnings": [...]}``，调用方可据此决定是否需要持久化。
+    """
+    disabled = state.get("disabled")
+    if not isinstance(disabled, dict):
+        return {"changed": False, "added": [], "restored": [], "warnings": []}
+
+    changed = False
+    ddir = _disabled_dir()
+    disk_names: set[str] = set()
+    if os.path.isdir(ddir):
+        try:
+            for entry in os.listdir(ddir):
+                full = os.path.join(ddir, entry)
+                if os.path.isdir(full) or os.path.isfile(full):
+                    disk_names.add(entry)
+        except Exception as e:
+            log.warning(
+                "auto_node_disable: reconcile: cannot list %s: %s", ddir, e,
+            )
+
+    added: list[str] = []
+    restored: list[str] = []
+    warnings: list[str] = []
+
+    # Pass 1: state 已有条目 -> 对账磁盘
+    for name, info in list(disabled.items()):
+        if not isinstance(info, dict):
+            warnings.append(name)
+            continue
+        on_disk = name in disk_names
+        if on_disk:
+            if info.get("status") == "pending":
+                info["status"] = "confirmed"
+                changed = True
+            continue
+        # 磁盘上没有 -> 检查是否被恢复回原位
+        original = (info.get("original_path") or "").strip()
+        if original and os.path.exists(original):
+            disabled.pop(name, None)
+            changed = True
+            restored.append(name)
+            log.info(
+                "auto_node_disable: reconcile: removed %s from disabled "
+                "(original_path %s exists again)",
+                name, original,
+            )
+            continue
+        # 既不在磁盘、也不在原位 -> 告警保留
+        warnings.append(name)
+        log.warning(
+            "auto_node_disable: reconcile: %s is in state['disabled'] but "
+            "neither on disk (.disabled/) nor at original_path %s; "
+            "leaving as-is",
+            name, original or "<empty>",
+        )
+
+    # Pass 2: 磁盘上有、state 没有 -> 补齐
+    for name in sorted(disk_names):
+        if name in disabled:
+            continue
+        disabled[name] = {
+            "original_path": "",
+            "disabled_at": time.time(),
+            "status": "confirmed",
+            "node_classes": [],
+        }
+        changed = True
+        added.append(name)
+        log.info(
+            "auto_node_disable: reconcile: added %s to state['disabled'] "
+            "(found in .disabled/ but missing from state)",
+            name,
+        )
+
+    return {
+        "changed": changed,
+        "added": added,
+        "restored": restored,
+        "warnings": warnings,
+    }
 
 
 def _reconcile_pending(state: dict[str, Any]) -> bool:

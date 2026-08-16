@@ -410,6 +410,213 @@ class RecoveryFallbackTests(_IsolatedTestBase):
 
 
 # ---------------------------------------------------------------------------
+# 4b. 启动对账：.disabled/ 与 state['disabled'] 同步
+# ---------------------------------------------------------------------------
+
+
+class StartupReconcileDiskTests(_IsolatedTestBase):
+    """启动时 ``_reconcile_disabled_with_disk`` 的四种场景。
+
+    覆盖：
+    - 状态与磁盘完全一致 → 不修改任何东西
+    - 磁盘有、状态无 → 补齐状态（added）
+    - 状态有、磁盘无、original_path 重新可见 → 删除状态记录（restored）
+    - 状态有、磁盘无、original_path 也无 → 警告并保留（warnings）
+    - ``_load_state`` 集成测试：状态文件落盘后下次启动能补齐
+    """
+
+    # ----- 场景 1：状态与磁盘一致 -----
+
+    def test_no_change_when_state_and_disk_agree(self):
+        """state['disabled'] 与 .disabled/ 一一对应时，不做任何变更。"""
+        # 构造一个真实禁用模块（同时落入 state 与磁盘）
+        mod_path = self._make_module("mod_a")
+        s = auto_disable._default_state()
+        s["disabled"]["mod_a"] = {
+            "original_path": mod_path,
+            "disabled_at": 0.0,
+            "status": "confirmed",
+            "node_classes": ["ClassA"],
+        }
+        # 手动把磁盘上的 mod_a 移到 .disabled/，模拟"已禁用"状态
+        os.makedirs(self.disabled_dir, exist_ok=True)
+        shutil.move(mod_path, os.path.join(self.disabled_dir, "mod_a"))
+        auto_disable._save_state(s)
+
+        result = auto_disable._reconcile_disabled_with_disk(s)
+
+        self.assertFalse(result["changed"])
+        self.assertEqual(result["added"], [])
+        self.assertEqual(result["restored"], [])
+        self.assertEqual(result["warnings"], [])
+        self.assertIn("mod_a", s["disabled"])
+
+    # ----- 场景 2：磁盘有、状态无 → 补齐 -----
+
+    def test_disk_only_entry_is_added_to_state(self):
+        """磁盘上 .disabled/ 有但 state 里没有时，应追加到 state。"""
+        os.makedirs(self.disabled_dir, exist_ok=True)
+        # 手动在磁盘上建一个禁用模块
+        os.makedirs(os.path.join(self.disabled_dir, "external_mod"), exist_ok=True)
+        s = auto_disable._default_state()
+        auto_disable._save_state(s)
+
+        result = auto_disable._reconcile_disabled_with_disk(s)
+
+        self.assertTrue(result["changed"])
+        self.assertEqual(result["added"], ["external_mod"])
+        self.assertEqual(result["restored"], [])
+        # state 应被补齐
+        self.assertIn("external_mod", s["disabled"])
+        info = s["disabled"]["external_mod"]
+        self.assertEqual(info["status"], "confirmed")
+        self.assertEqual(info["original_path"], "")
+        self.assertEqual(info["node_classes"], [])
+
+    def test_disk_only_file_is_added_to_state(self):
+        """磁盘上是单文件（不是目录）时也应被识别并补齐。"""
+        os.makedirs(self.disabled_dir, exist_ok=True)
+        # 单文件模块也是合法形态（_disable_module 可以移文件）
+        with open(
+            os.path.join(self.disabled_dir, "single.py"), "w", encoding="utf-8"
+        ) as f:
+            f.write("# disabled\n")
+        s = auto_disable._default_state()
+        auto_disable._save_state(s)
+
+        result = auto_disable._reconcile_disabled_with_disk(s)
+
+        self.assertEqual(result["added"], ["single.py"])
+        self.assertIn("single.py", s["disabled"])
+
+    # ----- 场景 3：状态有、磁盘无、original_path 可见 → 删除 -----
+
+    def test_state_entry_with_restored_original_path_is_removed(self):
+        """state 里有记录但磁盘上 .disabled/ 已无，且 original_path 重新可见
+        （说明用户手动恢复过）→ 从 state 中清理。"""
+        # original_path 是真实存在的目录，模拟"已被用户手工移回"
+        mod_path = self._make_module("manual_restore")
+        s = auto_disable._default_state()
+        s["disabled"]["manual_restore"] = {
+            "original_path": mod_path,
+            "disabled_at": 1.0,
+            "status": "confirmed",
+            "node_classes": ["ClassZ"],
+        }
+        auto_disable._save_state(s)
+        # .disabled/ 里没有 manual_restore（磁盘上为空）
+
+        result = auto_disable._reconcile_disabled_with_disk(s)
+
+        self.assertTrue(result["changed"])
+        self.assertEqual(result["restored"], ["manual_restore"])
+        self.assertEqual(result["added"], [])
+        self.assertNotIn("manual_restore", s["disabled"])
+
+    # ----- 场景 4：状态有、磁盘无、original_path 也无 → 警告保留 -----
+
+    def test_orphan_state_entry_is_warned_but_kept(self):
+        """state 里有记录但磁盘与 original_path 都不在 → 警告并保留。"""
+        s = auto_disable._default_state()
+        s["disabled"]["orphan_mod"] = {
+            "original_path": os.path.join(self.tmpdir, "definitely_missing"),
+            "disabled_at": 1.0,
+            "status": "confirmed",
+            "node_classes": ["ClassY"],
+        }
+        auto_disable._save_state(s)
+
+        result = auto_disable._reconcile_disabled_with_disk(s)
+
+        # changed=False（我们没有删除它），但加入 warnings
+        self.assertFalse(result["changed"])
+        self.assertEqual(result["warnings"], ["orphan_mod"])
+        # 记录仍存在
+        self.assertIn("orphan_mod", s["disabled"])
+
+    def test_orphan_with_empty_original_path_is_warned_but_kept(self):
+        """original_path 为空字符串的孤儿条目也应保留。"""
+        s = auto_disable._default_state()
+        s["disabled"]["orphan_empty"] = {
+            "original_path": "",
+            "disabled_at": 1.0,
+            "status": "confirmed",
+            "node_classes": [],
+        }
+        auto_disable._save_state(s)
+
+        result = auto_disable._reconcile_disabled_with_disk(s)
+
+        self.assertFalse(result["changed"])
+        self.assertEqual(result["warnings"], ["orphan_empty"])
+        self.assertIn("orphan_empty", s["disabled"])
+
+    # ----- 场景 5：混合场景 -----
+
+    def test_mixed_scenario_handles_each_case_independently(self):
+        """state 与磁盘混合不一致时，4 类场景同时触发，各自处理。"""
+        os.makedirs(self.disabled_dir, exist_ok=True)
+        # 磁盘上：disk_only（场景 2）+ on_disk_normal（场景 1）
+        os.makedirs(os.path.join(self.disabled_dir, "disk_only"), exist_ok=True)
+        on_disk_path = os.path.join(self.disabled_dir, "on_disk_normal")
+        os.makedirs(on_disk_path, exist_ok=True)
+        # 自建一个被用户手动移回的模块
+        manual_path = self._make_module("manual_restored")
+
+        s = auto_disable._default_state()
+        s["disabled"]["on_disk_normal"] = {
+            "original_path": "",
+            "disabled_at": 0.0,
+            "status": "confirmed",
+        }
+        s["disabled"]["manual_restored"] = {
+            "original_path": manual_path,
+            "disabled_at": 0.0,
+            "status": "confirmed",
+        }
+        s["disabled"]["orphan"] = {
+            "original_path": os.path.join(self.tmpdir, "no_such_path"),
+            "disabled_at": 0.0,
+            "status": "confirmed",
+        }
+        auto_disable._save_state(s)
+
+        result = auto_disable._reconcile_disabled_with_disk(s)
+
+        self.assertTrue(result["changed"])
+        self.assertEqual(result["added"], ["disk_only"])
+        self.assertEqual(result["restored"], ["manual_restored"])
+        self.assertEqual(result["warnings"], ["orphan"])
+        # on_disk_normal 保持不变
+        self.assertIn("on_disk_normal", s["disabled"])
+        # manual_restored 应被清掉
+        self.assertNotIn("manual_restored", s["disabled"])
+        # orphan 应保留
+        self.assertIn("orphan", s["disabled"])
+        # disk_only 应被补齐
+        self.assertIn("disk_only", s["disabled"])
+
+    # ----- 集成：通过 _load_state 触发对账 -----
+
+    def test_load_state_persists_disk_only_additions(self):
+        """``_load_state`` 加载时发现磁盘独有条目，落盘后状态文件更新。"""
+        os.makedirs(self.disabled_dir, exist_ok=True)
+        os.makedirs(os.path.join(self.disabled_dir, "outside_mod"), exist_ok=True)
+
+        # 初始 state 文件（不包含 outside_mod）
+        s0 = auto_disable._default_state()
+        auto_disable._save_state(s0)
+
+        # 重新加载（触发对账 + 持久化）
+        auto_disable._load_state()
+
+        # 再读一次确认已落盘
+        s_after = auto_disable._load_state()
+        self.assertIn("outside_mod", s_after["disabled"])
+        self.assertEqual(s_after["disabled"]["outside_mod"]["status"], "confirmed")
+
+
+# ---------------------------------------------------------------------------
 # 4. 窗口修剪
 # ---------------------------------------------------------------------------
 
@@ -537,13 +744,17 @@ class WindowPruningTests(_IsolatedTestBase):
 
     def test_disabled_exceeds_known_when_stale_entries_exist(self):
         """``disabled`` 比 ``known`` 多时（陈旧条目），摘要如实反映两者。"""
+        # 建一个真正被禁用的模块（custom_nodes/ → .disabled/ 物理移动）
         mod_path = self._make_module("kept_mod")
+        os.makedirs(self.disabled_dir, exist_ok=True)
+        shutil.move(mod_path, os.path.join(self.disabled_dir, "kept_mod"))
         s = self._state(threshold=3, rounds=[])
         # known 1 个，但 disabled 字典里已经预先塞了 3 条陈旧记录
         s["known_modules"] = {
             "kept_mod": {"node_classes": ["KeptClass"], "module_path": mod_path},
         }
         s["disabled"] = {
+            # 2 条孤儿：不在磁盘上、original_path 也为空 → 对账后保留为 warning
             "old_mod_a": {
                 "original_path": "", "disabled_at": 0.0,
                 "status": "confirmed",
@@ -552,6 +763,7 @@ class WindowPruningTests(_IsolatedTestBase):
                 "original_path": "", "disabled_at": 0.0,
                 "status": "confirmed",
             },
+            # 1 条正常：on_disk 验证过 original_path 存在、被 reconcile 保留
             "kept_mod": {
                 "original_path": mod_path, "disabled_at": 0.0,
                 "status": "confirmed",
@@ -565,11 +777,12 @@ class WindowPruningTests(_IsolatedTestBase):
         self.assertEqual(summary["disabled_count"], 3)
         # 3 > 1，应当是“全部 known 被禁 + 2 条陈旧”
         self.assertGreater(summary["disabled_count"], summary["known_count"])
+        # 本轮【没有新增】禁用（reconcile 已把 kept_mod 视为已确认禁用）
         self.assertEqual(summary["newly_disabled"], [])
 
 
 # ---------------------------------------------------------------------------
-# 5. 刻意构造的失败用例（用于展示测试网格的捕获能力）
+# 6. 刻意构造的失败用例（用于展示测试网格的捕获能力）
 # ---------------------------------------------------------------------------
 
 
@@ -653,7 +866,7 @@ class DeliberateFailureDetectionTests(_IsolatedTestBase):
 
 
 # ---------------------------------------------------------------------------
-# 6. 缺失节点自动恢复：submit 引用未注册类 → .disabled 匹配 → 原子恢复
+# 7. 缺失节点自动恢复：submit 引用未注册类 → .disabled 匹配 → 原子恢复
 # ---------------------------------------------------------------------------
 
 
