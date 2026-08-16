@@ -33,6 +33,12 @@ try:
 except Exception:  # pragma: no cover - 极端情况下允许被导入但不挂载
     PromptServer = None
 
+try:
+    # ComfyUI 新版（V3 扩展）要求扩展通过 comfy_entrypoint 暴露 ComfyExtension
+    from comfy_api.extension import ComfyExtension
+except Exception:  # pragma: no cover - 旧版 ComfyUI 没有 comfy_api
+    ComfyExtension = None  # type: ignore[assignment]
+
 from . import auto_disable
 
 
@@ -40,7 +46,28 @@ log = logging.getLogger("auto_node_disable")
 
 WEB_DIRECTORY = "./web/js"
 
-__all__ = ["WEB_DIRECTORY"]
+# 本插件不提供任何节点；显式声明空映射以满足 ComfyUI 的
+# "node module 必须至少包含 NODE_CLASS_MAPPINGS 或 comfy_entrypoint"
+# 校验，避免启动日志出现 "Skip ... lack of NODE_CLASS_MAPPINGS
+# or comfy_entrypoint" 警告。
+NODE_CLASS_MAPPINGS: dict[str, Any] = {}
+NODE_DISPLAY_NAME_MAPPINGS: dict[str, str] = {}
+
+__all__ = [
+    "WEB_DIRECTORY",
+    "NODE_CLASS_MAPPINGS",
+    "NODE_DISPLAY_NAME_MAPPINGS",
+]
+
+
+if ComfyExtension is not None:
+    class _AutoNodeDisableExtension(ComfyExtension):
+        """V3 扩展形态：仅声明 ``WEB_DIRECTORY``，由 ``comfy_entrypoint`` 暴露。"""
+
+        WEB_DIRECTORY = "./web/js"
+
+    def comfy_entrypoint():  # noqa: D401 - ComfyUI 要求的固定名称
+        return _AutoNodeDisableExtension()
 
 
 # ---------------------------------------------------------------------------
