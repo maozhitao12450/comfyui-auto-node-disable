@@ -187,11 +187,29 @@ JSON 写入是**原子化**的（先写 `.tmp` 再 `os.replace`），可以安�
 
 ### 前端面板
 
-`web/js/autoDisable.js` 会在 ComfyUI 的 **Settings** 面板下注入一个菜单项，提供：
+插件通过 `web/js/autoDisable.js` 在 ComfyUI 里暴露两个入口：
 
-- 当前已知模块 / 已禁用模块列表；
-- 调整阈值与排除名单；
-- 一键恢复被禁用模块。
+**1) Settings 对话框（齿轮菜单 → ComfyUI Settings → 搜索 "Auto Node Disable"）**
+
+使用 `app.registerExtension({ settings: [...] })` 注册三个标准设置项，能被搜索、按 ID 引用，并自动持久化到浏览器本地存储：
+
+| 设置项 ID | 类型 | 默认值 | 说明 |
+| --- | --- | --- | --- |
+| `AutoNodeDisable.Threshold` | `number` | `30` | 连续未使用次数阈值；调整为 `0` 关闭自动禁用 |
+| `AutoNodeDisable.Exclude` | `text` | `comfyui-auto-node-disable,ComfyUI-Manager` | 逗号分隔的永不自动禁用模块列表 |
+| `AutoNodeDisable.DryRun` | `boolean` | `false` | 开启后只写审计字段、不移动目录 |
+
+这三项变更都会通过 `onChange` 实时调用 `/auto_disable/threshold` / `/auto_disable/exclude` 后端 API 同步落盘。
+
+**2) 顶栏 "Auto Disable" 按钮（点击后弹出浮窗）**
+
+页面上找不到 Settings 时可以走这条路——脚本会向 ComfyUI 顶栏（`.comfy-menu` / `.litegraph-toolbar` / `body`）追加一个按钮，点击后弹出浮窗，包含：
+
+- 当前阈值 / dry_run / 排除列表速览；
+- 已自动禁用模块列表，每个模块带"恢复"按钮（恢复后需重启 ComfyUI）；
+- 已知 custom_node 模块 JSON 折叠面板（调试用）。
+
+> 浮窗是按需渲染的，首次点击时才拉取 `/auto_disable/status`，不会拖慢启动。
 
 ---
 
