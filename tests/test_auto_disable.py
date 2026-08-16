@@ -483,6 +483,7 @@ class WindowPruningTests(_IsolatedTestBase):
         """``record_prompt`` 返回进度摘要，供调用方记录到日志。"""
         s = self._state(threshold=7, rounds=[self._round() for _ in range(4)])
         s["dry_run"] = False
+        s["known_modules"] = self._known({"mod_a": ["A1"], "mod_b": ["B1"]})
         auto_disable._save_state(s)
 
         summary = auto_disable.record_prompt(["A1", "B2"])
@@ -491,21 +492,48 @@ class WindowPruningTests(_IsolatedTestBase):
         self.assertEqual(summary["threshold"], 7)
         # keep = max(threshold + 2, 5) = max(9, 5) = 9
         self.assertEqual(summary["keep"], 9)
+        # cap = keep * 4
+        self.assertEqual(summary["cap"], 36)
         # 原本 4 轮，append 后 5 轮
         self.assertEqual(summary["rounds_count"], 5)
         self.assertEqual(summary["dry_run"], False)
+        self.assertEqual(summary["known_count"], 2)
+        self.assertEqual(summary["disabled_count"], 0)
+        self.assertEqual(summary["newly_disabled"], [])
 
     def test_record_prompt_summary_reflects_dry_run(self):
         """``dry_run=True`` 状态返回的摘要应带 ``dry_run=True``。"""
         s = self._state(threshold=3, rounds=[])
         s["dry_run"] = True
+        s["known_modules"] = self._known({"mod_a": ["A1"]})
         auto_disable._save_state(s)
 
-        summary = auto_disable.record_prompt(["X"])
+        summary = auto_disable.record_prompt(["A1"])
 
         self.assertEqual(summary["dry_run"], True)
         self.assertEqual(summary["threshold"], 3)
         self.assertEqual(summary["rounds_count"], 1)
+        # dry_run=True 时，A1 与 mod_a 重叠，不应被加入 disabled
+        self.assertEqual(summary["known_count"], 1)
+        self.assertEqual(summary["disabled_count"], 0)
+
+    def test_record_prompt_summary_records_newly_disabled(self):
+        """当本次入队导致一个已知模块被禁用时，摘要应反映出来。"""
+        # 在临时目录里真的建一个被禁用的模块，_disable_module 才能成功移动。
+        mod_path = self._make_module("ghost_mod")
+        s = self._state(threshold=1, rounds=[])
+        # known_modules 必须带 module_path，否则 _disable_module 拿不到源路径会回滚。
+        s["known_modules"] = {
+            "ghost_mod": {"node_classes": ["GhostClass"], "module_path": mod_path},
+        }
+        auto_disable._save_state(s)
+
+        summary = auto_disable.record_prompt(["A1", "B2"])
+
+        self.assertEqual(summary["newly_disabled"], ["ghost_mod"])
+        self.assertEqual(summary["disabled_count"], 1)
+        self.assertEqual(summary["known_count"], 1)
+        self.assertEqual(summary["threshold"], 1)
 
 
 # ---------------------------------------------------------------------------

@@ -88,14 +88,46 @@ def _on_prompt(json_data: dict[str, Any], *args, **kwargs):
             prompt_id = json_data.get("prompt_id")
         # 透传 prompt_id 以便写入状态文件的审计字段，
         # 事后可重建“哪个入队导致哪个目录被禁用”的因果链。
-        summary = auto_disable.record_prompt(used, prompt_id=prompt_id)
-        rounds_count = summary.get("rounds_count", "?") if isinstance(summary, dict) else "?"
-        threshold = summary.get("threshold", "?") if isinstance(summary, dict) else "?"
-        keep = summary.get("keep", "?") if isinstance(summary, dict) else "?"
+        summary = auto_disable.record_prompt(used, prompt_id=prompt_id) or {}
+        rounds_count = summary.get("rounds_count", "?")
+        cap = summary.get("cap", summary.get("keep", "?"))
+        threshold = summary.get("threshold", "?")
+        dry_run = bool(summary.get("dry_run", False))
+        known_count = summary.get("known_count", "?")
+        newly = summary.get("newly_disabled") or []
+        disabled_count = summary.get("disabled_count", "?")
+
+        mode = "DRY-RUN " if dry_run else ""
+        if newly:
+            tail = f" -> just disabled: {newly}"
+        elif isinstance(known_count, int) and known_count == 0:
+            tail = " (no known custom_node modules yet)"
+        elif (
+            isinstance(disabled_count, int)
+            and isinstance(known_count, int)
+            and disabled_count == known_count
+        ):
+            tail = (
+                f" (all {known_count} known modules already disabled; "
+                "check /auto_disable/status)"
+            )
+        elif (
+            isinstance(disabled_count, int)
+            and isinstance(known_count, int)
+            and disabled_count < known_count
+        ):
+            remaining = known_count - disabled_count
+            tail = (
+                f" ({remaining} still active: their classes intersect with this "
+                "prompt's nodes or they are in the exclude list)"
+            )
+        else:
+            tail = ""
         log.info(
-            "auto_node_disable: recorded prompt %s with %d distinct nodes "
-            "(rounds=%s/keep*4=%s, threshold=%s)",
-            prompt_id, len(used), rounds_count, keep, threshold,
+            "auto_node_disable: %srecorded prompt %s with %d distinct nodes "
+            "(rounds=%s/cap=%s, threshold=%s, known=%s, disabled=%s)%s",
+            mode, prompt_id, len(used),
+            rounds_count, cap, threshold, known_count, disabled_count, tail,
         )
     except Exception as e:
         log.warning("auto_node_disable: on_prompt handler failed: %s", e)
@@ -202,11 +234,28 @@ def _setup() -> None:
     # 启动时同步一次 known_modules（便于用户在 UI 没启动前看到节点列表）
     try:
         snap = auto_disable.snapshot()
-        if not snap.get("known_modules"):
+        existing = snap.get("known_modules") or {}
+        if not existing:
             state = auto_disable._load_state()  # noqa: SLF001 - 内部工具
             auto_disable._scan_known_modules(state)  # noqa: SLF001
             auto_disable._save_state(state)  # noqa: SLF001
-            log.info("auto_node_disable: scanned known modules at startup")
+            n = len(state.get("known_modules") or {})
+            if n == 0:
+                log.warning(
+                    "auto_node_disable: startup scan found 0 custom_node modules; "
+                    "is ComfyUI fully loaded? If you have plugins installed but they "
+                    "don't appear here, check NODE_CLASS_MAPPINGS exposure."
+                )
+            else:
+                log.info(
+                    "auto_node_disable: startup scan found %d custom_node modules",
+                    n,
+                )
+        else:
+            log.info(
+                "auto_node_disable: %d known modules already cached in state",
+                len(existing),
+            )
     except Exception as e:
         log.warning("auto_node_disable: startup scan failed: %s", e)
 

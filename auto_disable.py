@@ -295,7 +295,13 @@ def record_prompt(
         用于事后审计"哪个入队导致哪个目录被禁用"。如果 ``prompt_or_json``
         是 dict 且包含 ``prompt_id`` 字段，则优先采用字段值。
     :return: 本次入队后的进度摘要，字段包括 ``rounds_count`` / ``threshold`` /
-        ``keep`` / ``dry_run``，供调用方在日志/遥测里使用。
+        ``keep`` / ``cap`` / ``dry_run`` / ``known_count`` /
+        ``newly_disabled`` / ``disabled_count``，供调用方在日志/遥测里使用。
+        - ``cap`` = ``keep * 4``，是滚动窗口的裁剪上限。
+        - ``known_count`` 为已反推出的 ``custom_node`` 模块数。
+        - ``newly_disabled`` 是本次决策新加入 ``disabled`` 的模块名列表。
+        - ``disabled_count`` 是 ``disabled`` 字典的当前条目总数（含
+          pending/confirmed/dry_run）。
     """
     # 兼容两种输入：dict (原始请求体) 或可迭代对象 (已提取的类名集合)
     if isinstance(prompt_or_json, dict):
@@ -338,19 +344,25 @@ def record_prompt(
         _save_state(state)
 
         # 即时决策（传入本次入队标识以便写入 disabled 审计字段）
+        newly_disabled: list[str] = []
         try:
-            _decide(state, last_prompt_id=prompt_id)
+            newly_disabled = _decide(state, last_prompt_id=prompt_id) or []
         except Exception as e:
             log.warning("auto_node_disable: decision step failed: %s", e)
         else:
             _save_state(state)
 
         # 返回本次入队后的进度摘要，供调用方记录到日志/遥测。
+        disabled_map = state.get("disabled") or {}
         return {
             "rounds_count": len(state["rounds"]),
             "threshold": int(state.get("threshold", DEFAULT_THRESHOLD)),
             "keep": keep,
+            "cap": keep * 4,
             "dry_run": bool(state.get("dry_run", False)),
+            "known_count": len(state.get("known_modules") or {}),
+            "newly_disabled": list(newly_disabled),
+            "disabled_count": len(disabled_map),
         }
 
 
