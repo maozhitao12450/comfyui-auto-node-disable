@@ -173,17 +173,39 @@ def _disabled_dir() -> str:
 
 _state_lock = threading.RLock()
 
+# 启动一次性扫描标志：进程生命周期内首次 ``_load_state`` 调用触发全量扫描
+# 并把 ``known_modules`` 写入 SQLite；之后 ``_load_state`` 不再扫描，
+# 由 ``restore_for_missing_classes`` 在自动恢复后回填 ``known_modules``。
+# 设为模块级变量便于 ``reset_startup_scan_flag`` 在测试 setup 中重置，
+# 实现"每个测试用例独立触发一次启动扫描"的隔离。
+_STARTUP_SCAN_DONE = False
+
+
+def reset_startup_scan_flag() -> None:
+    """重置启动扫描标志。
+
+    主要用途：测试 ``setUp`` 里在 mock 完路径常量后调用，使该测试首次
+    ``_load_state`` 调用能再次触发启动扫描逻辑（验证扫描被调用一次、
+    后续 ``_load_state`` 不再扫描）。
+    """
+    global _STARTUP_SCAN_DONE
+    _STARTUP_SCAN_DONE = False
+
 
 def _load_state() -> dict[str, Any]:
     """读取状态；不存在则返回默认结构。
 
     读路径：
     1. 启动时执行 ``_migrate_legacy_state``，把旧版 ``.json`` 导入 SQLite 并归档。
-    2. 走 ``auto_disable._storage.load_state_from_db`` 从 SQLite 装载 dict。
+    2. **首次调用**：执行 ``_scan_known_modules`` 全量扫描当前
+       ``NODE_CLASS_MAPPINGS``，把 ``known_modules`` 写入 SQLite 并置标志；
+       同一进程内后续 ``_load_state`` 不再重复扫描。
+    3. 走 ``auto_disable._storage.load_state_from_db`` 从 SQLite 装载 dict。
        任何读错误（文件缺失、表损坏、JSON 反序列化失败）都会被 ``load_state_from_db``
        吞掉并落回默认状态，绝不抛出。
-    3. 启动时对齐 ``pending`` 与 ``disabled``，如果对账造成变更则回写 SQLite。
+    4. 启动时对齐 ``pending`` 与 ``disabled``，如果对账造成变更则回写 SQLite。
     """
+    global _STARTUP_SCAN_DONE
     # 启动时把旧位置（ComfyUI 根目录）的 JSON 状态迁移到 SQLite 数据库
     _migrate_legacy_state()
     data = auto_disable._storage.load_state_from_db(_state_path())
@@ -193,6 +215,30 @@ def _load_state() -> dict[str, Any]:
         data.setdefault(k, v)
     if not isinstance(data.get("pending_restart"), list):
         data["pending_restart"] = []
+
+    # 启动一次性扫描：首次 ``_load_state`` 调用时执行。
+    # 设计理由：
+    # - 启动时 ``NODE_CLASS_MAPPINGS`` 已加载完毕，扫描开销一次性承担；
+    # - 之后 ``record_prompt`` 不再每次重扫，避免每条 prompt 都遍历全局映射；
+    # - 运行中新增模块由 ``restore_for_missing_classes`` 自动回填，
+    #   重装 / 卸载场景由用户调用 ``refresh_known_modules`` 手动刷新。
+    if not _STARTUP_SCAN_DONE:
+        try:
+            auto_disable._scan_known_modules(data)
+        except Exception as e:
+            log.warning(
+                "auto_node_disable: startup known_modules scan failed: %s", e,
+            )
+        _STARTUP_SCAN_DONE = True
+        # 启动扫描结果立即落盘，使后续进程重启无需再次扫描
+        try:
+            _atomic_write_json(_state_path(), data)
+        except Exception as e:
+            log.warning(
+                "auto_node_disable: failed to persist startup known_modules: %s",
+                e,
+            )
+
     # 启动时对齐 pending 与目录实际位置（进程崩溃后恢复用）
     pending_changed = _reconcile_pending(data)
     # 启动时对齐 disabled 与 .disabled/ 磁盘：补齐手工禁用、清理被手动恢复的条目
@@ -453,6 +499,7 @@ consume_pending_restart = _api.consume_pending_restart
 set_threshold = _api.set_threshold
 set_exclude = _api.set_exclude
 set_dry_run = _api.set_dry_run
+refresh_known_modules = _api.refresh_known_modules
 snapshot = _api.snapshot
 extract_used_class_names = _api.extract_used_class_names
 
@@ -480,6 +527,7 @@ __all__ = [
     "_default_state",
     "_atomic_write_json",
     "_save_state",
+    "reset_startup_scan_flag",
     # SQLite 存储层
     "_storage",
     # 反向映射
@@ -500,6 +548,7 @@ __all__ = [
     "set_threshold",
     "set_exclude",
     "set_dry_run",
+    "refresh_known_modules",
     "snapshot",
     "extract_used_class_names",
     "log",

@@ -199,6 +199,17 @@ def restore_for_missing_classes(
             "prompt_id": prompt_id,
         })
 
+        # 把刚恢复的模块加入 ``known_modules``，确保下一轮 ``_decide`` 把它
+        # 视为“已知且当前可用”，不会因为“该模块不在 known_modules”被绕过禁用，
+        # 也避免下一轮 ``record_prompt`` 又需要依赖启动扫描的回填。
+        # ``_load_state`` 只在进程启动时一次性扫描，所以恢复时必须主动回填。
+        known = state.setdefault("known_modules", {})
+        if module_name not in known:
+            known[module_name] = {
+                "node_classes": sorted(node_classes),
+                "module_path": info.get("original_path", ""),
+            }
+
         if not missing:
             break
 

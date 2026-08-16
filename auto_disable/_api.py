@@ -62,6 +62,40 @@ def set_dry_run(enabled: bool) -> None:
         auto_disable._save_state(state)
 
 
+def refresh_known_modules() -> dict[str, Any]:
+    """运行时强制刷新 ``state["known_modules"]``。
+
+    设计动机
+    --------
+    ``_load_state`` 在进程启动时只扫描一次 ``NODE_CLASS_MAPPINGS``，之后
+    不再重扫（避免每条 prompt 都遍历全局映射）。运行中如果用户在磁盘上
+    新装 / 重装 / 卸载 ``custom_node`` 模块但未重启 ComfyUI，可以通过本接口
+    手动触发一次全量扫描，让 ``known_modules`` 与磁盘现状重新对齐。
+
+    典型场景：
+    - 装了新模块：扫描后新模块加入 ``known_modules``，下一次 record_prompt
+      若用到新模块的类，``_decide`` 会按正常流程对待；
+    - 卸载了模块：扫描后该模块从 ``known_modules`` 移除，不再被视为
+      “待禁用候选”；
+    - 重命名 / 移动了模块目录：扫描后路径信息刷新。
+
+    返回当前 ``known_modules`` 的 ``{name: {"node_classes": [...],
+    "module_path": "..."}}`` 视图，便于前端展示 / 调试。
+    """
+    with auto_disable._state_lock:
+        state = auto_disable._load_state()
+        auto_disable._scan_known_modules(state)
+        auto_disable._save_state(state)
+        # 返回副本避免外部篡改内部状态
+        return {
+            name: {
+                "node_classes": list(info.get("node_classes") or []),
+                "module_path": info.get("module_path", ""),
+            }
+            for name, info in (state.get("known_modules") or {}).items()
+        }
+
+
 def snapshot() -> dict[str, Any]:
     """获取当前状态（只读快照）。"""
     with auto_disable._state_lock:

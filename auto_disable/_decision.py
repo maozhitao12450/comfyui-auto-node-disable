@@ -60,7 +60,11 @@ def decide(
     dry_run = bool(state.get("dry_run", False))
 
     newly: list[str] = []
-    for module_name, info in known.items():
+    # 用 list() 复制 key 列表：下面循环里可能会 ``known.pop(module_name)`` 同步
+    # 状态，迭代过程中修改原字典会触发 RuntimeError。这里要保护的是“运行时
+    # 多轮决策可能同步改 known”这一不变量。
+    for module_name in list(known.keys()):
+        info = known[module_name]
         if module_name in exclude:
             continue
         if module_name in disabled:
@@ -116,6 +120,11 @@ def decide(
         # 3) 根据移动结果收敛状态：成功→confirmed，失败→回滚
         if moved:
             pending_record["status"] = "confirmed"
+            # 从 ``known_modules`` 移除：模块已不在 ``custom_nodes/``，
+            # 下次启动扫描也不会包含它。避免 ``_decide`` 再次把它作为
+            # “待禁用候选”重复处理，同时与 ``restore_for_missing_classes``
+            # 恢复后会主动回填 ``known_modules`` 的对称设计保持一致。
+            known.pop(module_name, None)
             try:
                 auto_disable._atomic_write_json(auto_disable._state_path(), state)
             except Exception as e:

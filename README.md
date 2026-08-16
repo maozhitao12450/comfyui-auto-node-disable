@@ -123,7 +123,9 @@ ComfyUI/
 ├── custom_nodes/
 │   ├── comfyui-auto-node-disable/
 │   │   ├── auto_disable.py
-│   │   └── auto_node_disable_state.json    ← 插件的状态文件（与代码同目录）
+│   │   ├── auto_node_disable_state.db     ← SQLite 状态文件（与代码同目录）
+│   │   ├── auto_node_disable_state.db-wal ← WAL 模式辅助文件（运行时）
+│   │   └── auto_node_disable_state.db-shm ← WAL 模式辅助文件（运行时）
 │   ├── ComfyUI-Manager/
 │   ├── .disabled/                          ← 已被自动禁用的模块暂存区
 │   │   └── <module_name>/
@@ -131,8 +133,17 @@ ComfyUI/
 ```
 
 > 旧版（v0.x 及更早）状态文件位于 `ComfyUI/auto_node_disable_state.json`。
-> 升级后第一次启动会自动迁移到该位置（`os.replace` 原子重命名）。如果新旧文件同时存在，以新为准。
-> 如需手动清理，删除旧位置的 `auto_node_disable_state.json` 即可。
+> 升级后第一次启动会自动迁移到该位置（以新为准），旧 JSON 文件会被归档为
+> `auto_node_disable_state.json.migrated`。如需手动清理，删除旧位置的 JSON 即可。
+
+### 7. 已知模块（`known_modules`）的同步策略
+
+`state["known_modules"]` 记录所有“当前仍可用”的 `custom_node` 模块与它们提供的节点类。它通过以下流程保持同步：
+
+- **启动时一次性扫描**：进程启动时首次 ``_load_state`` 调用会执行一次全量扫描，把结果写入 SQLite；之后 ``record_prompt`` 不再每轮重扫，避免每条 prompt 都遍历 ``NODE_CLASS_MAPPINGS``。
+- **物理 disable 后从 `known_modules` 移除**：模块被搬到 `.disabled/` 后会从 `known_modules` 移除，避免下一轮决策把它再次视为待禁用候选。
+- **自动恢复后回填 `known_modules`**：`restore_for_missing_classes` 触发模块移回 `custom_nodes/` 时会立即把该模块加入 `known_modules`，让下一轮决策能把它当作“已知且当前可用”。
+- **运行时手动刷新**：通过 HTTP API 或 Python 入口调用 ``refresh_known_modules``，可强制重新扫描 ``NODE_CLASS_MAPPINGS``，适配“运行时新装/卸载模块”场景。
 
 ---
 
@@ -202,6 +213,7 @@ JSON 写入是**原子化**的（先写 `.tmp` 再 `os.replace`），可以安�
 | `POST` | `/auto_disable/threshold` | `{"value": <int>}` | 调整决策阈值 |
 | `POST` | `/auto_disable/exclude` | `{"names": [...]}` | 更新排除名单 |
 | `POST` | `/auto_disable/pending_restart` | `{}` | 拉取并清空“待重启”提示列表（前端在 `api.queuePrompt` 之后调用） |
+| `POST` | `/auto_disable/refresh_known` | `{}` | 运行时强制刷新 `state["known_modules"]`，适配“运行中新装/卸载模块”场景 |
 
 ### 前端面板
 

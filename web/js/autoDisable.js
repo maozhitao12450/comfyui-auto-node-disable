@@ -21,12 +21,19 @@
  *   POST /auto_disable/threshold {"value": <int>}
  *   POST /auto_disable/exclude   {"names": ["..."]}
  *   POST /auto_disable/pending_restart   取走并清空 待重启 提示列表
+ *   POST /auto_disable/refresh_known    强制刷新 known_modules（运行中新装/卸载模块后使用）
  *
  * 自动恢复流程：
  *   1. 提交工作流时若发现某个 class_type 在当前 NODE_CLASS_MAPPINGS 中缺失，
  *      后端去 .disabled 找能提供该类的模块并自动移回 custom_nodes。
  *   2. 这次恢复会写入 state.pending_restart，前端在 prompt 响应后调用
  *      pending_restart 端点拉取并弹 请重启 ComfyUI 提示。
+ *
+ * known_modules 同步策略：
+ *   - 进程启动时后端会一次性扫描 NODE_CLASS_MAPPINGS 填充 known_modules；
+ *   - 物理 disable 后会从 known_modules 移除；
+ *   - 自动恢复后会回填 known_modules；
+ *   - 运行时新装/卸载模块需要手动调 refresh_known 重新扫描。
  */
 
 import { app } from "../../../scripts/app.js";
@@ -174,6 +181,31 @@ function renderPanel(root, status) {
         renderPanel(root, s);
     };
     root.appendChild(refresh);
+
+    // 重新扫描已知模块按钮：运行中新装/卸载模块后调用，
+    // 触发后端走 refresh_known_modules 路径重扫 NODE_CLASS_MAPPINGS。
+    const rescan = document.createElement("button");
+    rescan.textContent = "重新扫描已知模块";
+    rescan.style.marginTop = "10px";
+    rescan.style.marginLeft = "6px";
+    rescan.title = "运行中新装/卸载了 custom_node？点此重新扫描 known_modules";
+    rescan.onclick = async () => {
+        const before = refresh.disabled;
+        refresh.disabled = true;
+        rescan.disabled = true;
+        rescan.textContent = "扫描中…";
+        const r = await postJSON("/refresh_known", {});
+        // 不论成功失败都重新拉取一次状态
+        const s = await fetchStatus();
+        renderPanel(root, s);
+        refresh.disabled = !!before;
+        rescan.disabled = false;
+        rescan.textContent = "重新扫描已知模块";
+        if (!r || !r.ok) {
+            console.warn("[auto_disable] refresh_known failed:", r && r.error);
+        }
+    };
+    root.appendChild(rescan);
 }
 
 // ---------------------------------------------------------------------------

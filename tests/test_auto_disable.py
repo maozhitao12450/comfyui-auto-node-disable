@@ -304,7 +304,12 @@ class WindowPruningTests(_IsolatedTestBase):
         self.assertEqual(summary["disabled_count"], 0)
 
     def test_record_prompt_summary_records_newly_disabled(self):
-        """当本次入队导致一个已知模块被禁用时，摘要应反映出来。"""
+        """当本次入队导致一个已知模块被禁用时，摘要应反映出来。
+
+        补充语义：物理 disable 成功后该模块会从 ``known_modules`` 移除
+        （与 ``restore_for_missing_classes`` 恢复后会回填 ``known_modules``
+        对称），所以 ``known_count`` 反映“当前仍可用”的模块数。
+        """
         # 在临时目录里真的建一个被禁用的模块，_disable_module 才能成功移动。
         mod_path = self._make_module("ghost_mod")
         s = self._state(threshold=1, rounds=[])
@@ -318,7 +323,8 @@ class WindowPruningTests(_IsolatedTestBase):
 
         self.assertEqual(summary["newly_disabled"], ["ghost_mod"])
         self.assertEqual(summary["disabled_count"], 1)
-        self.assertEqual(summary["known_count"], 1)
+        # ghost_mod 已被物理移走，从 known_modules 移除后剩 0 个“当前可用”模块
+        self.assertEqual(summary["known_count"], 0)
         self.assertEqual(summary["threshold"], 1)
 
     def test_disabled_exceeds_known_when_stale_entries_exist(self):

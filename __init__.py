@@ -220,6 +220,22 @@ def _register_routes(server) -> None:
         items = auto_disable.consume_pending_restart()
         return web.json_response({"ok": True, "items": items})
 
+    @routes.post("/auto_disable/refresh_known")
+    async def _refresh_known(request):
+        """运行时强制刷新 ``state["known_modules"]``。
+
+        适用场景：用户在不重启 ComfyUI 的情况下手动安装了 / 卸载了
+        ``custom_node`` 模块；本接口会重扫 ``NODE_CLASS_MAPPINGS`` 并把
+        最新的反向映射持久化到 SQLite。返回 ``{"ok": true, "known":
+        {name: {"node_classes": [...], "module_path": "..."}}}``，便于前端
+        即时刷新面板。
+        """
+        try:
+            known = auto_disable.refresh_known_modules()
+        except Exception as e:
+            return web.json_response({"ok": False, "error": str(e)}, status=500)
+        return web.json_response({"ok": True, "known": known})
+
 
 # ---------------------------------------------------------------------------
 # 启动时挂载钩子与路由

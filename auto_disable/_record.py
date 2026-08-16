@@ -5,10 +5,9 @@
 本函数负责
 
 1. 从 payload 抽取本次用到的节点类名；
-2. 刷新 ``state["known_modules"]``；
-3. 触发缺失节点类的自动恢复（``restore_for_missing_classes``）；
-4. 写入一条 ``rounds`` 记录并修剪窗口大小；
-5. 调用 ``_decide`` 做一次决策。
+2. 触发缺失节点类的自动恢复（``restore_for_missing_classes``）；
+3. 写入一条 ``rounds`` 记录并修剪窗口大小；
+4. 调用 ``_decide`` 做一次决策。
 
 调用方约定
 ----------
@@ -60,8 +59,10 @@ def record_prompt(
 
     with auto_disable._state_lock:
         state = auto_disable._load_state()
-        # 每次启动/扫描都可能发现新模块，先刷新
-        auto_disable._scan_known_modules(state)
+        # ``known_modules`` 由 ``_load_state`` 在进程启动时一次性扫描并持久化；
+        # 运行中新增模块通过 ``restore_for_missing_classes`` 自动回填，
+        # 重装 / 卸载场景请调用 ``refresh_known_modules`` 手动刷新。
+        # 此处不再每次 record_prompt 都扫，避免每条 prompt 都遍历全局映射。
 
         used = sorted(set(used_class_names))
 

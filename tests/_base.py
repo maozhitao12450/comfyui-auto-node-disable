@@ -59,6 +59,11 @@ class _IsolatedTestBase(unittest.TestCase):
         for p in self._patches:
             p.start()
 
+        # 重置启动扫描标志：每个测试用例的首次 ``_load_state`` 调用都需要
+        # 重新触发启动扫描逻辑，以验证“启动时一次性扫描、之后不再扫描”
+        # 的语义，并允许 mock 替换后重新进入设置。
+        auto_disable.reset_startup_scan_flag()
+
     def tearDown(self) -> None:
         for p in self._patches:
             p.stop()
