@@ -332,15 +332,15 @@ class StateLocationMigrationTests(unittest.TestCase):
 
     def setUp(self) -> None:
         self.tmpdir = tempfile.mkdtemp(prefix="auto_disable_migrate_")
-        # 旧位置：ComfyUI 根目录
+        # 旧位置：ComfyUI 根目录（JSON 后缀）
         self.legacy_root = os.path.join(self.tmpdir, "ComfyUI_old")
         self.legacy_path = os.path.join(
-            self.legacy_root, "auto_node_disable_state.json"
+            self.legacy_root, auto_disable.LEGACY_STATE_FILENAME
         )
-        # 新位置：插件目录（与 auto_disable.py 同目录）
+        # 新位置：插件目录（SQLite 后缀，跟随现行 STATE_FILENAME）
         self.plugin_dir = os.path.join(self.tmpdir, "plugin")
         self.new_path = os.path.join(
-            self.plugin_dir, "auto_node_disable_state.json"
+            self.plugin_dir, auto_disable.STATE_FILENAME
         )
         os.makedirs(self.legacy_root, exist_ok=True)
         os.makedirs(self.plugin_dir, exist_ok=True)
@@ -365,37 +365,94 @@ class StateLocationMigrationTests(unittest.TestCase):
         with open(self.legacy_path, "w", encoding="utf-8") as f:
             json.dump(payload, f)
 
-    def test_legacy_is_moved_to_plugin_dir(self):
-        """旧位置存在且新位置不存在时，迁移后旧文件消失、新文件出现。"""
-        self._write_legacy({"threshold": 7, "note": "from legacy"})
+    def _read_db_dict(self, db_path: str) -> dict:
+        """从任意路径的 SQLite 文件读取 state dict（不依赖 ``self.state_file``）。"""
+        import sqlite3 as _sqlite3
+        with _sqlite3.connect(db_path) as conn:
+            conn.row_factory = _sqlite3.Row
+            # settings 阈值是必看字段，其它字段（known/rounds/disabled/pending_restart）
+            # 如果不存在则取默认值，与产品代码的默认值保持一致。
+            state = {
+                "threshold": auto_disable.DEFAULT_THRESHOLD,
+                "dry_run": False,
+                "exclude": list(auto_disable.DEFAULT_EXCLUDE),
+                "known_modules": {},
+                "rounds": [],
+                "disabled": {},
+                "pending_restart": [],
+            }
+            row = conn.execute(
+                "SELECT key, value FROM settings WHERE key = ?", ("threshold",)
+            ).fetchone()
+            if row is not None:
+                try:
+                    state["threshold"] = int(row["value"])
+                except (ValueError, TypeError):
+                    pass
+            row = conn.execute(
+                "SELECT key, value FROM settings WHERE key = ?", ("dry_run",)
+            ).fetchone()
+            if row is not None:
+                state["dry_run"] = row["value"] in ("1", "true", "True")
+            row = conn.execute(
+                "SELECT key, value FROM settings WHERE key = ?", ("exclude",)
+            ).fetchone()
+            if row is not None:
+                try:
+                    state["exclude"] = json.loads(row["value"])
+                except Exception:
+                    pass
+            extra_rows = conn.execute(
+                "SELECT key, value FROM settings WHERE key NOT IN "
+                "('threshold', 'dry_run', 'exclude')"
+            ).fetchall()
+            for r in extra_rows:
+                state[r["key"]] = r["value"]
+            return state
+
+    def test_legacy_is_migrated_to_plugin_dir(self):
+        """旧位置存在且新位置不存在时，迁移后旧 JSON 被归档、新位置变成 SQLite 且内容一致。"""
+        self._write_legacy({"threshold": 7})
         self.assertTrue(os.path.exists(self.legacy_path))
         self.assertFalse(os.path.exists(self.new_path))
 
         auto_disable._migrate_legacy_state()
 
+        # 旧 JSON 被归档为 .json.migrated，不再以原名存在
         self.assertFalse(os.path.exists(self.legacy_path))
+        self.assertTrue(os.path.exists(self.legacy_path + ".migrated"))
+        # 新位置现在是 SQLite 数据库文件
         self.assertTrue(os.path.exists(self.new_path))
-        with open(self.new_path, "r", encoding="utf-8") as f:
-            data = json.load(f)
-        self.assertEqual(data["threshold"], 7)
-        self.assertEqual(data["note"], "from legacy")
+        # 读 SQLite 验证 threshold 被正确迁移
+        persisted = self._read_db_dict(self.new_path)
+        self.assertEqual(persisted["threshold"], 7)
 
-    def test_legacy_kept_when_new_already_exists(self):
-        """新旧都存在时，新为准；旧文件保留并告警（不覆盖新文件）。"""
-        self._write_legacy({"threshold": 1, "winner": "legacy"})
-        new_payload = {"threshold": 9, "winner": "new"}
-        with open(self.new_path, "w", encoding="utf-8") as f:
-            json.dump(new_payload, f)
+    def test_new_kept_when_both_exist(self):
+        """新旧都存在时，新 SQLite 为准；旧 JSON 被归档为 .migrated，不覆盖新文件。"""
+        self._write_legacy({"threshold": 1})
+        # 新位置预填一份 SQLite（threshold=9），代表“已有状态”场景
+        auto_disable._storage.save_state_to_db(
+            self.new_path,
+            {
+                "threshold": 9,
+                "dry_run": False,
+                "exclude": [],
+                "known_modules": {},
+                "rounds": [],
+                "disabled": {},
+                "pending_restart": [],
+            },
+        )
 
         auto_disable._migrate_legacy_state()
 
-        # 两份都保留
-        self.assertTrue(os.path.exists(self.legacy_path))
+        # 旧 JSON 被归档为 .migrated
+        self.assertFalse(os.path.exists(self.legacy_path))
+        self.assertTrue(os.path.exists(self.legacy_path + ".migrated"))
+        # 新 SQLite 仍在且未被覆盖
         self.assertTrue(os.path.exists(self.new_path))
-        with open(self.new_path, "r", encoding="utf-8") as f:
-            data = json.load(f)
-        self.assertEqual(data["winner"], "new")
-        self.assertEqual(data["threshold"], 9)
+        persisted = self._read_db_dict(self.new_path)
+        self.assertEqual(persisted["threshold"], 9)
 
     def test_no_op_when_legacy_missing(self):
         """旧位置不存在时，迁移是 no-op（不创建新文件）。"""
@@ -406,22 +463,22 @@ class StateLocationMigrationTests(unittest.TestCase):
         self.assertFalse(os.path.exists(self.new_path))
 
     def test_load_state_triggers_migration(self):
-        """``_load_state`` 调用时自动迁移旧位置 -> 插件目录。"""
+        """``_load_state`` 调用时自动迁移旧位置 -> 插件目录（JSON 归档 + SQLite 落地）。"""
         self._write_legacy({"threshold": 11})
 
         loaded = auto_disable._load_state()
 
-        # 旧文件应被搬走
+        # 旧 JSON 被归档为 .migrated，新位置变 SQLite
         self.assertFalse(os.path.exists(self.legacy_path))
-        # 新文件应存在
+        self.assertTrue(os.path.exists(self.legacy_path + ".migrated"))
         self.assertTrue(os.path.exists(self.new_path))
         # 加载时应能读到旧配置
         self.assertEqual(loaded["threshold"], 11)
 
     def test_legacy_path_is_comfy_root_state(self):
-        """验证 ``_legacy_state_path`` 拼出的是 ComfyUI 根目录下的文件名。"""
+        """验证 ``_legacy_state_path`` 拼出的是 ComfyUI 根目录下的旧 JSON 文件名。"""
         expected = os.path.join(
-            self.legacy_root, auto_disable.STATE_FILENAME
+            self.legacy_root, auto_disable.LEGACY_STATE_FILENAME
         )
         self.assertEqual(auto_disable._legacy_state_path(), expected)
 

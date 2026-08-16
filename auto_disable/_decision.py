@@ -6,7 +6,7 @@
 
 调用方约定
 ----------
-所有依赖（路径常量、原子写入、状态文件路径、_disabled_dir 等）必须通过
+所有依赖（路径常量、状态持久化、状态文件路径、_disabled_dir 等）必须通过
 ``auto_disable._xxx()`` 走包级属性查找。
 """
 
@@ -98,7 +98,7 @@ def decide(
             "status": "pending",
         }
         disabled[module_name] = pending_record
-        # 直接调原子写，不走 _save_state 的吞异常路径，否则失败会被吃掉
+        # 直接调原子持久化，不走 _save_state 的吞异常路径，否则失败会被吃掉
         try:
             auto_disable._atomic_write_json(auto_disable._state_path(), state)
         except Exception as e:

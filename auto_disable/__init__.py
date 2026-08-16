@@ -11,8 +11,9 @@ auto_disable
   ``RELATIVE_PYTHON_MODULE`` 属性，反向构建
   ``custom_node 子目录名 -> 它提供的节点类名集合`` 的映射。
 - 每次有工作流入队（``prompt`` API），都从 prompt 中提取本次用到的节点类
-  并写入一份滚动状态文件（默认放在插件目录内 ``auto_node_disable_state.json``，
-  与本文件同目录；旧版本位于 ComfyUI 根目录，首次启动会自动迁移）。
+  并写入一份滚动状态（默认放在插件目录内 ``auto_node_disable_state.db``，
+  SQLite 数据库；与本文件同目录）。历史版本使用同名 ``.json`` 文件，
+  首次启动会自动迁移并归档为 ``.json.migrated``。
 - 当滚动窗口内连续 ``threshold``（默认 30）次入队都未出现某 custom_node 的节点类时，
   将该 custom_node 目录移动到 ``custom_nodes/.disabled/<原名>/`` 下。
 - 用户可在状态文件里通过 ``exclude`` 列表永久保留某些 custom_node 不被自动禁用。
@@ -48,7 +49,6 @@ auto_disable
 
 from __future__ import annotations
 
-import json
 import logging
 import os
 import shutil
@@ -57,6 +57,13 @@ import threading
 import time
 from typing import Any, Iterable, Optional
 
+# Python 模块对象的 __dict__ 不会自动包含模块自身名，但子模块函数体
+# 里需要用 ``auto_disable._xxx()`` 这种包级查找访问基础能力（保持 mock
+# 可见）。在 __init__ 顶部显式 ``import auto_disable`` 把名字绑定到本模块
+# globals，让 ``_atomic_write_json`` / ``_load_state`` 等函数体内能写
+# ``auto_disable._storage.xxx()`` 而不报 NameError。
+import auto_disable  # noqa: F401  (used for global name binding only)
+
 log = logging.getLogger("auto_node_disable")
 
 
@@ -64,8 +71,14 @@ log = logging.getLogger("auto_node_disable")
 # 路径常量
 # ---------------------------------------------------------------------------
 
-# 状态文件名（保存在插件目录内，与代码同目录，便于跟插件一起分发/迁移）
-STATE_FILENAME = "auto_node_disable_state.json"
+# 状态文件名（SQLite 数据库，保留在插件目录内与代码同目录，便于分发迁移）。
+# 历史版本同名 ``.json`` 文件会在首次启动时被 ``_storage.migrate_json_to_db``
+# 自动读取并归档为 ``.json.migrated``。
+STATE_FILENAME = "auto_node_disable_state.db"
+
+# 旧版 JSON 文件名（历史兼容常量）。与 ``STATE_FILENAME`` 解耦：旧版使用
+# ``.json`` 后缀，新版使用 ``.db``。迁移过程中需要独立识别旧位置的文件名。
+LEGACY_STATE_FILENAME = "auto_node_disable_state.json"
 
 # 禁用目录名（位于 custom_nodes/ 下）
 DISABLED_DIR_NAME = ".disabled"
@@ -120,18 +133,23 @@ def _state_path() -> str:
 
 
 def _legacy_state_path() -> str:
-    """旧版状态文件位置：ComfyUI 根目录（``custom_nodes`` 的父目录）。"""
-    return os.path.join(_comfy_root(), STATE_FILENAME)
+    """旧版 JSON 状态文件位置：ComfyUI 根目录（``custom_nodes`` 的父目录）。
+
+    历史上状态文件一直叫 ``auto_node_disable_state.json``（迁移到 SQLite 后
+    才改名 ``.db``），所以这里直接写死 ``.json``，避免和现行 ``STATE_FILENAME``
+    不同后缀时反而读不到旧文件。
+    """
+    return os.path.join(_comfy_root(), LEGACY_STATE_FILENAME)
 
 
 def _migrate_legacy_state() -> None:
-    """把旧位置的 ``auto_node_disable_state.json`` 迁移到插件目录内。
+    """把旧位置的 ``auto_node_disable_state.json`` 迁移到 SQLite 数据库。
 
-    规则：
-    - 旧文件不存在：no-op
-    - 新文件已存在：以新为准，旧文件留待用户自行清理并告警
+    实际迁移逻辑委托给 ``auto_disable._storage.migrate_json_to_db``：
+    - 旧 JSON 不存在：no-op
+    - 新 DB 已存在：以新为准，旧 JSON 文件被归档为 ``.migrated`` 并记 info
     - 同路径（测试 / 插件恰好就装在 ComfyUI 根目录）：no-op
-    - 否则用 ``os.replace`` 原子重命名（同一文件系统则原地瞬移，否则抛错）
+    - 否则读取 JSON → 写入 SQLite → ``os.replace`` 归档原文件
     """
     legacy = _legacy_state_path()
     new = _state_path()
@@ -140,27 +158,9 @@ def _migrate_legacy_state() -> None:
             return
     except Exception:
         return
-    if not os.path.exists(legacy):
-        return
-    if os.path.exists(new):
-        log.warning(
-            "auto_node_disable: legacy state at %s exists but new state at %s "
-            "already exists; keeping new, please remove the legacy file manually",
-            legacy, new,
-        )
-        return
-    try:
-        os.makedirs(os.path.dirname(new), exist_ok=True)
-        os.replace(legacy, new)
-        log.info(
-            "auto_node_disable: migrated legacy state file %s -> %s",
-            legacy, new,
-        )
-    except Exception as e:
-        log.warning(
-            "auto_node_disable: failed to migrate legacy state from %s to %s: %s",
-            legacy, new, e,
-        )
+    # 无论迁移是否真发生，``migrate_json_to_db`` 都会处理归档；
+    # 失败时它内部会记 warning，不会抛出。
+    auto_disable._storage.migrate_json_to_db(legacy, new)
 
 
 def _disabled_dir() -> str:
@@ -175,23 +175,22 @@ _state_lock = threading.RLock()
 
 
 def _load_state() -> dict[str, Any]:
-    """读取状态文件；不存在则返回默认结构。"""
-    # 启动时把旧位置（ComfyUI 根目录）的状态文件迁移到插件目录内
+    """读取状态；不存在则返回默认结构。
+
+    读路径：
+    1. 启动时执行 ``_migrate_legacy_state``，把旧版 ``.json`` 导入 SQLite 并归档。
+    2. 走 ``auto_disable._storage.load_state_from_db`` 从 SQLite 装载 dict。
+       任何读错误（文件缺失、表损坏、JSON 反序列化失败）都会被 ``load_state_from_db``
+       吞掉并落回默认状态，绝不抛出。
+    3. 启动时对齐 ``pending`` 与 ``disabled``，如果对账造成变更则回写 SQLite。
+    """
+    # 启动时把旧位置（ComfyUI 根目录）的 JSON 状态迁移到 SQLite 数据库
     _migrate_legacy_state()
-    path = _state_path()
-    if not os.path.exists(path):
-        return _default_state()
-    try:
-        with open(path, "r", encoding="utf-8") as f:
-            data = json.load(f)
-    except Exception as e:
-        log.warning("auto_node_disable: state file unreadable (%s); starting fresh", e)
-        return _default_state()
-    # 兼容旧结构：补齐缺失字段
+    data = auto_disable._storage.load_state_from_db(_state_path())
+    # 兼容旧结构：补齐缺失字段（防御性，正常路径 load_state_from_db 已补齐）
     defaults = _default_state()
     for k, v in defaults.items():
         data.setdefault(k, v)
-    # pending_restart 必须是 list；旧版本不存在该字段时已被 setdefault 填充为 []
     if not isinstance(data.get("pending_restart"), list):
         data["pending_restart"] = []
     # 启动时对齐 pending 与目录实际位置（进程崩溃后恢复用）
@@ -200,7 +199,7 @@ def _load_state() -> dict[str, Any]:
     disk_result = _reconcile_disabled_with_disk(data)
     if pending_changed or disk_result["changed"]:
         try:
-            _atomic_write_json(path, data)
+            _atomic_write_json(_state_path(), data)
         except Exception as e:
             log.warning(
                 "auto_node_disable: failed to persist reconciled state: %s", e
@@ -267,8 +266,10 @@ def _reconcile_disabled_with_disk(state: dict[str, Any]) -> dict[str, Any]:
                 changed = True
             continue
         # 磁盘上没有 -> 检查是否被恢复回原位
+        # 注意：``dry_run`` 条目从未实际移动过目录，原路径必然存在，
+        # 但这是“预计会被移动”而非“已被用户手动恢复”，因此跳过此分支。
         original = (info.get("original_path") or "").strip()
-        if original and os.path.exists(original):
+        if info.get("status") != "dry_run" and original and os.path.exists(original):
             disabled.pop(name, None)
             changed = True
             restored.append(name)
@@ -390,14 +391,18 @@ def _default_state() -> dict[str, Any]:
 
 
 def _atomic_write_json(path: str, data: dict[str, Any]) -> None:
-    """原子写入 JSON，避免半写文件导致损坏。"""
-    tmp = path + ".tmp"
-    with open(tmp, "w", encoding="utf-8") as f:
-        json.dump(data, f, ensure_ascii=False, indent=2)
-    os.replace(tmp, path)
+    """原子化持久化 ``state``。
+
+    历史上该函数直接写 JSON 文件；2026-08-17 改造为 SQLite 存储后保留
+    函数名与签名，内部委托给 ``auto_disable._storage.save_state_to_db``，
+    这样 ``verify_hot_path.py`` 的故障注入与既有测试中的 mock patch
+    不需要改动。
+    """
+    auto_disable._storage.save_state_to_db(path, data)
 
 
 def _save_state(state: dict[str, Any]) -> None:
+    """写入状态；任何异常都吞掉并告警，避免污染调用方热路径。"""
     try:
         _atomic_write_json(_state_path(), state)
     except Exception as e:
@@ -422,6 +427,10 @@ from auto_disable import _record as _record  # noqa: E402
 from auto_disable import _decision as _decision  # noqa: E402
 from auto_disable import _restore as _restore  # noqa: E402
 from auto_disable import _api as _api  # noqa: E402
+from auto_disable import _storage as _storage  # noqa: E402
+
+# SQLite 存储层（_storage.py）由 _load_state / _save_state / _migrate_legacy_state
+# 通过包级属性查找调用，对外不直接暴露但保留在 ``__all__`` 中以便测试与诊断脚本使用。
 
 # 反向映射（_scanner.py）
 _scan_known_modules = _scanner.scan_known_modules
@@ -451,6 +460,7 @@ extract_used_class_names = _api.extract_used_class_names
 __all__ = [
     # 常量
     "STATE_FILENAME",
+    "LEGACY_STATE_FILENAME",
     "DISABLED_DIR_NAME",
     "DEFAULT_THRESHOLD",
     "DEFAULT_EXCLUDE",
@@ -470,6 +480,8 @@ __all__ = [
     "_default_state",
     "_atomic_write_json",
     "_save_state",
+    # SQLite 存储层
+    "_storage",
     # 反向映射
     "_scan_known_modules",
     "_resolve_module_path",

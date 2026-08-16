@@ -121,7 +121,8 @@ class _FakeComfyEnv:
 
         # 让 auto_disable._state_path() 把状态文件落在我们的临时目录里，
         # 而不是进程的 cwd / 真实 ComfyUI 根。
-        self.state_path = os.path.join(self.comfy_root, "auto_node_disable_state.json")
+        # 状态文件名跟随产品常量（2026-08-17 起从 ``.json`` 迁到 ``.db``）。
+        self.state_path = os.path.join(self.comfy_root, auto_disable.STATE_FILENAME)
 
         self._original_nodes = sys.modules.get("nodes")
         self._original_state_path_factory = auto_disable._state_path

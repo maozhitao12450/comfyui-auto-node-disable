@@ -128,10 +128,27 @@ def _assert(cond: bool, msg: str) -> None:
 
 
 def _reset_state() -> None:
-    """清空状态文件、disabled 目录，把模块从稳定备份还原。"""
+    """清空状态文件、disabled 目录，把模块从稳定备份还原。
+
+    Windows 下 SQLite 进程句柄可能还持有 db 文件，``unlink`` 会失败
+    （PermissionError）；更可靠的做法是直接打开连接并清空所有业务表。
+    """
     p = Path(auto_disable._state_path())
-    if p.exists():
-        p.unlink()
+    import sqlite3
+    try:
+        with sqlite3.connect(str(p)) as conn:
+            for tbl in (
+                "settings",
+                "known_modules",
+                "rounds",
+                "disabled",
+                "pending_restart",
+            ):
+                conn.execute(f"DELETE FROM {tbl}")
+            conn.commit()
+    except sqlite3.OperationalError:
+        # db 文件还不存在：下次 ``_save_state`` 会重建空 schema
+        pass
     if DISABLED_DIR.exists():
         shutil.rmtree(DISABLED_DIR)
     DISABLED_DIR.mkdir()

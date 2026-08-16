@@ -416,8 +416,7 @@ class MissingNodeAutoRestoreTests(_IsolatedTestBase):
             s = auto_disable._load_state()
             auto_disable.restore_for_missing_classes(s, ["ClassA"], prompt_id="p-disk")
         # 直接读状态文件确认
-        with open(self.state_file, "r", encoding="utf-8") as f:
-            persisted = json.load(f)
+        persisted = self._read_state_raw()
         self.assertEqual(len(persisted["pending_restart"]), 1)
         self.assertEqual(persisted["pending_restart"][0]["module"], "mod_a")
         self.assertEqual(persisted["pending_restart"][0]["prompt_id"], "p-disk")
@@ -435,8 +434,7 @@ class MissingNodeAutoRestoreTests(_IsolatedTestBase):
         ):
             auto_disable.record_prompt(["ClassA"], prompt_id="pid-rp")
         # 落盘后状态文件里：mod_a 应已恢复，pending_restart 有该条目
-        with open(self.state_file, "r", encoding="utf-8") as f:
-            persisted = json.load(f)
+        persisted = self._read_state_raw()
         self.assertNotIn("mod_a", persisted["disabled"])
         self.assertEqual(len(persisted["pending_restart"]), 1)
         self.assertEqual(persisted["pending_restart"][0]["module"], "mod_a")
@@ -452,8 +450,7 @@ class MissingNodeAutoRestoreTests(_IsolatedTestBase):
             return_value={"ClassA"},
         ):
             auto_disable.record_prompt(["ClassA"], prompt_id="pid-skip")
-        with open(self.state_file, "r", encoding="utf-8") as f:
-            persisted = json.load(f)
+        persisted = self._read_state_raw()
         self.assertIn("mod_a", persisted["disabled"])
         self.assertEqual(persisted.get("pending_restart", []), [])
 
@@ -461,7 +458,8 @@ class MissingNodeAutoRestoreTests(_IsolatedTestBase):
         """旧版本状态文件缺 pending_restart 字段时，加载后应被补齐为 []。"""
         legacy = auto_disable._default_state()
         legacy.pop("pending_restart", None)
-        auto_disable._atomic_write_json(self.state_file, legacy)
+        # 走 SQLite 写入模拟“旧结构”（缺字段）的状态文件
+        self._write_state_raw(legacy)
         loaded = auto_disable._load_state()
         self.assertEqual(loaded.get("pending_restart"), [])
 

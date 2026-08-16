@@ -6,6 +6,10 @@ __pycache__/
 # ComfyUI 运行时副作用产物（状态文件 + 实际移动的目录）
 auto_node_disable_state.json
 auto_node_disable_state.json.tmp
+auto_node_disable_state.json.migrated
+auto_node_disable_state.db
+auto_node_disable_state.db-wal
+auto_node_disable_state.db-shm
 custom_nodes/.disabled/
 
 # 工具自身产物：聚焦门禁日志
