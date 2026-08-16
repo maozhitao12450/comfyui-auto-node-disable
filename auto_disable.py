@@ -45,6 +45,7 @@ import json
 import logging
 import os
 import shutil
+import sys
 import threading
 import time
 from typing import Any, Iterable, Optional
@@ -227,19 +228,34 @@ def _reconcile_disabled_with_disk(state: dict[str, Any]) -> dict[str, Any]:
     for name in sorted(disk_names):
         if name in disabled:
             continue
+        # 主动 import 该模块提取 NODE_CLASS_MAPPINGS，以便后续
+        # restore_for_missing_classes 能按类名匹配。
+        disabled_path = os.path.join(ddir, name)
+        node_classes = _extract_node_classes_from_path(disabled_path)
+        # node_classes=None 表示扫描失败（异常/路径不存在），区别于
+        # 加载成功但未声明映射（[]）。
+        if node_classes is None:
+            log.warning(
+                "auto_node_disable: reconcile: added %s to state['disabled'] "
+                "but could not extract NODE_CLASS_MAPPINGS; "
+                "auto-restore by class name will not work for this module",
+                name,
+            )
+            node_classes = []
+        else:
+            log.info(
+                "auto_node_disable: reconcile: added %s to state['disabled'] "
+                "(scanned %d node_classes: %s)",
+                name, len(node_classes), node_classes,
+            )
         disabled[name] = {
             "original_path": "",
             "disabled_at": time.time(),
             "status": "confirmed",
-            "node_classes": [],
+            "node_classes": node_classes,
         }
         changed = True
         added.append(name)
-        log.info(
-            "auto_node_disable: reconcile: added %s to state['disabled'] "
-            "(found in .disabled/ but missing from state)",
-            name,
-        )
 
     return {
         "changed": changed,
@@ -386,6 +402,68 @@ def _resolve_module_path(module_name: str) -> str:
     if os.path.isfile(file_py):
         return os.path.abspath(file_py)
     return ""
+
+
+def _extract_node_classes_from_path(path: str) -> Optional[list[str]]:
+    """安全地从某个已禁用模块路径里提取 ``NODE_CLASS_MAPPINGS`` 的 key 列表。
+
+    调用场景：reconcile 时发现磁盘上有但 state 里没有的模块；为了后续的
+    ``restore_for_missing_classes`` 能按类名匹配，需要知道该模块提供了哪些类。
+
+    实现要点
+    --------
+
+    - 仅在 ``.disabled/<name>`` 目录或单 ``.py`` 文件存在时尝试。
+    - 使用 :mod:`importlib.util` 以文件路径方式加载（不依赖 ``sys.path`` 顺序）。
+    - **严格捕获所有异常**——导入、副作用、语法错误、缺失依赖一律返回 ``None``，
+      绝不向 reconcile 流程抛出。
+    - 仅读取顶层 ``__init__.py``（目录形态）或单 ``.py``；不递归子包，避免
+      装载面失控。
+    - 读取 ``NODE_CLASS_MAPPINGS`` 时仅接受 dict；其它形态视为未提供。
+
+    返回排序后的类名列表，失败时返回 ``None``（语义区别于空列表——后者表示
+    模块加载成功但未声明节点映射）。
+    """
+    if not path or not os.path.exists(path):
+        return None
+    try:
+        import importlib.util as _ilu
+
+        if os.path.isdir(path):
+            init_py = os.path.join(path, "__init__.py")
+            if not os.path.isfile(init_py):
+                return None
+            target = init_py
+        elif os.path.isfile(path) and path.endswith(".py"):
+            target = path
+        else:
+            return None
+
+        # 使用带 id 后缀的合成模块名，避免冲突且不会污染真实模块名空间
+        mod_name = (
+            f"_auto_disable_scan_{os.path.basename(path)}_{id(path)}"
+        )
+        spec = _ilu.spec_from_file_location(mod_name, target)
+        if spec is None or spec.loader is None:
+            return None
+
+        module = _ilu.module_from_spec(spec)
+        # 把合成模块注册到 sys.modules，让模块内部 import 能找到自己
+        sys.modules.setdefault(mod_name, module)
+        try:
+            spec.loader.exec_module(module)
+        except Exception:
+            # 导入期任何异常（依赖缺失、语法错、副作用报错）一律吞掉
+            return None
+
+        mapping = getattr(module, "NODE_CLASS_MAPPINGS", None)
+        if isinstance(mapping, dict) and mapping:
+            return sorted(str(k) for k in mapping.keys() if k)
+        # exec_module 成功：无论是否声明了 NODE_CLASS_MAPPINGS，都按“已加载、
+        # 但未提供映射”处理，返回空列表。仅 exec_module 抛异常时才返回 None。
+        return []
+    except Exception:
+        return None
 
 
 # ---------------------------------------------------------------------------
@@ -766,10 +844,18 @@ def restore_for_missing_classes(
 
     disabled: dict[str, Any] = state.get("disabled") or {}
     if not disabled:
+        # 有 missing 类但 disabled 字典是空的（不应该发生除非 state 被重置）。
+        log.info(
+            "auto_node_disable: missing classes %s but state['disabled'] is empty; "
+            "nothing to auto-restore",
+            sorted(missing),
+        )
         return []
 
     restored: list[str] = []
     pending_restart: list[dict[str, Any]] = list(state.get("pending_restart") or [])
+    candidates_with_classes = 0
+    candidates_skipped_no_classes = 0
 
     # 复制 keys 后再迭代，避免恢复过程中字典被修改
     for module_name, info in list(disabled.items()):
@@ -782,7 +868,9 @@ def restore_for_missing_classes(
         node_classes = set(info.get("node_classes") or [])
         if not node_classes:
             # 历史记录里没有 node_classes（旧版本写入的），跳过以免误伤
+            candidates_skipped_no_classes += 1
             continue
+        candidates_with_classes += 1
         hit = node_classes & missing
         if not hit:
             continue
@@ -823,6 +911,24 @@ def restore_for_missing_classes(
         log.info(
             "auto_node_disable: auto-restored %d disabled module(s) for missing classes: %s",
             len(restored), restored,
+        )
+    elif candidates_with_classes == 0 and candidates_skipped_no_classes > 0:
+        # 有 missing 类、但所有 disabled 条目都没有 node_classes（陈旧记录）。
+        # 这种情况 reconcile 启动对账能修复：启动时扫描这些模块拿 NODE_CLASS_MAPPINGS。
+        log.warning(
+            "auto_node_disable: missing classes %s not auto-restored: "
+            "all %d disabled entries lack node_classes (legacy records). "
+            "Restart ComfyUI so reconcile can scan them.",
+            sorted(set(used_set) - registered),
+            candidates_skipped_no_classes,
+        )
+    elif candidates_with_classes > 0 and missing:
+        # 有 node_classes 的候选但都没命中——告诉用户哪些类还在漂
+        log.info(
+            "auto_node_disable: missing classes %s not matched by any of the "
+            "%d disabled modules with node_classes; "
+            "the providing module may have been deleted or renamed",
+            sorted(missing), candidates_with_classes,
         )
 
     return restored

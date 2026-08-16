@@ -454,9 +454,14 @@ class StartupReconcileDiskTests(_IsolatedTestBase):
     # ----- 场景 2：磁盘有、状态无 → 补齐 -----
 
     def test_disk_only_entry_is_added_to_state(self):
-        """磁盘上 .disabled/ 有但 state 里没有时，应追加到 state。"""
+        """磁盘上 .disabled/ 有但 state 里没有时，应追加到 state。
+
+        本测试场景下被扫描的“模块”是一个空目录（没有 ``__init__.py``），
+        reconcile 拿不到 ``NODE_CLASS_MAPPINGS``，``node_classes`` 应为空列表，
+        并打印一条 WARNING 提示类名扫描失败。
+        """
         os.makedirs(self.disabled_dir, exist_ok=True)
-        # 手动在磁盘上建一个禁用模块
+        # 手动在磁盘上建一个禁用模块（空目录 → 扫不到类名）
         os.makedirs(os.path.join(self.disabled_dir, "external_mod"), exist_ok=True)
         s = auto_disable._default_state()
         auto_disable._save_state(s)
@@ -466,7 +471,7 @@ class StartupReconcileDiskTests(_IsolatedTestBase):
         self.assertTrue(result["changed"])
         self.assertEqual(result["added"], ["external_mod"])
         self.assertEqual(result["restored"], [])
-        # state 应被补齐
+        # state 应被补齐；node_classes 因扫描失败为空列表
         self.assertIn("external_mod", s["disabled"])
         info = s["disabled"]["external_mod"]
         self.assertEqual(info["status"], "confirmed")
@@ -488,6 +493,79 @@ class StartupReconcileDiskTests(_IsolatedTestBase):
 
         self.assertEqual(result["added"], ["single.py"])
         self.assertIn("single.py", s["disabled"])
+
+    def test_disk_only_entry_scans_node_classes_when_importable(self):
+        """磁盘上的 disabled 模块若能 import 提取到 ``NODE_CLASS_MAPPINGS``，
+        reconcile 写入 state 时应带上扫描到的类名列表。
+        """
+        os.makedirs(self.disabled_dir, exist_ok=True)
+        # 造一个“被禁用”的 custom_node 目录，带 __init__.py + NODE_CLASS_MAPPINGS
+        mod_dir = os.path.join(self.disabled_dir, "scannable_mod")
+        os.makedirs(mod_dir, exist_ok=True)
+        with open(os.path.join(mod_dir, "__init__.py"), "w", encoding="utf-8") as f:
+            f.write(
+                "NODE_CLASS_MAPPINGS = {'ScanA': object(), 'ScanB': object(), 'ScanC': object()}\n"
+            )
+        s = auto_disable._default_state()
+        auto_disable._save_state(s)
+
+        result = auto_disable._reconcile_disabled_with_disk(s)
+
+        self.assertTrue(result["changed"])
+        self.assertEqual(result["added"], ["scannable_mod"])
+        info = s["disabled"]["scannable_mod"]
+        # reconcile 应在 reconcile 内扫到类名
+        self.assertEqual(sorted(info["node_classes"]), ["ScanA", "ScanB", "ScanC"])
+
+    def test_disk_only_entry_with_failing_import_does_not_crash(self):
+        """import 期间出错（依赖缺失、语法错）的 disabled 模块不应阻塞 reconcile。"""
+        os.makedirs(self.disabled_dir, exist_ok=True)
+        mod_dir = os.path.join(self.disabled_dir, "broken_mod")
+        os.makedirs(mod_dir, exist_ok=True)
+        # 语法错 + import 不存在的依赖
+        with open(os.path.join(mod_dir, "__init__.py"), "w", encoding="utf-8") as f:
+            f.write("import this_module_definitely_does_not_exist_xyz\n")
+        s = auto_disable._default_state()
+        auto_disable._save_state(s)
+
+        # 不应抛异常
+        result = auto_disable._reconcile_disabled_with_disk(s)
+
+        self.assertTrue(result["changed"])
+        self.assertEqual(result["added"], ["broken_mod"])
+        # node_classes 为空列表（scan 失败）但 state 仍然补齐了
+        self.assertIn("broken_mod", s["disabled"])
+        self.assertEqual(s["disabled"]["broken_mod"]["node_classes"], [])
+
+    def test_extract_node_classes_from_path_returns_none_for_missing(self):
+        """_extract_node_classes_from_path 对不存在路径应返回 None。"""
+        self.assertIsNone(
+            auto_disable._extract_node_classes_from_path(
+                os.path.join(self.tmpdir, "no_such_path")
+            )
+        )
+
+    def test_extract_node_classes_from_path_returns_list_for_real_module(self):
+        """_extract_node_classes_from_path 能从带 NODE_CLASS_MAPPINGS 的
+        __init__.py 提取类名。"""
+        mod_dir = os.path.join(self.tmpdir, "sample_mod")
+        os.makedirs(mod_dir, exist_ok=True)
+        with open(os.path.join(mod_dir, "__init__.py"), "w", encoding="utf-8") as f:
+            f.write(
+                "NODE_CLASS_MAPPINGS = {'Alpha': object(), 'Beta': object()}\n"
+            )
+        result = auto_disable._extract_node_classes_from_path(mod_dir)
+        self.assertEqual(result, ["Alpha", "Beta"])
+
+    def test_extract_node_classes_from_path_returns_empty_list_for_no_mapping(self):
+        """__init__.py 加载成功但未声明 NODE_CLASS_MAPPINGS → 返回空列表
+        （与加载失败返回 None 区分）。"""
+        mod_dir = os.path.join(self.tmpdir, "no_mapping_mod")
+        os.makedirs(mod_dir, exist_ok=True)
+        with open(os.path.join(mod_dir, "__init__.py"), "w", encoding="utf-8") as f:
+            f.write("# nothing here\n")
+        result = auto_disable._extract_node_classes_from_path(mod_dir)
+        self.assertEqual(result, [])
 
     # ----- 场景 3：状态有、磁盘无、original_path 可见 → 删除 -----
 
