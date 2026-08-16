@@ -56,7 +56,7 @@ STATE_FILENAME = "auto_node_disable_state.json"
 DISABLED_DIR_NAME = ".disabled"
 
 # 每次『打开页面』= 一次 prompt 入队；阈值默认 3 次
-DEFAULT_THRESHOLD = 3
+DEFAULT_THRESHOLD = 30
 
 # 默认排除列表：永不自动禁用的 custom_node 子目录名
 DEFAULT_EXCLUDE = (

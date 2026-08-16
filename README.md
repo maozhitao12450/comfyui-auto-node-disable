@@ -24,7 +24,7 @@
 
 - **零依赖**：仅使用 Python 标准库，不引入任何第三方包。
 - **自动追踪**：通过 ComfyUI 的 `onprompt` 钩子记录每一次工作流入队实际使用的节点类。
-- **滚动窗口决策**：连续 `threshold`（默认 3）次入队中某个 `custom_node` 提供的节点类全部未被使用，则视为可禁用。
+- **滚动窗口决策**：连续 `threshold`（默认 30）次入队中某个 `custom_node` 提供的节点类全部未被使用，则视为可禁用。
 - **原子化移动**：禁用采用"先持久化 `pending` → 再移动目录 → 最后落 `confirmed`"的三步流程；移动失败自动回滚状态，避免出现孤儿记录。
 - **进程崩溃自愈**：启动时按文件存在与否自动对齐遗留的 `pending` 条目——路径仍在则回滚，路径已不在则升级为 `confirmed`。
 - **审计可追溯**：每次入队的 `prompt_id` 透传到 `rounds` 条目；触发禁用的 `disabled` 条目会记录导致它的 `prompt_id`，事后可重建"哪个入队 → 哪个目录被禁用"的因果链。
@@ -127,7 +127,7 @@ ComfyUI/
 
 | 字段 | 默认值 | 说明 |
 | --- | --- | --- |
-| `threshold` | `3` | 连续多少轮入队未使用即触发禁用；`0` 关闭自动禁用 |
+| `threshold` | `30` | 连续多少轮入队未使用即触发禁用；`0` 关闭自动禁用 |
 | `dry_run` | `false` | `true` 时只写审计字段、不移动目录 |
 | `exclude` | `["comfyui-auto-node-disable", "ComfyUI-Manager"]` | 永不自动禁用的模块名列表 |
 
@@ -161,7 +161,7 @@ curl -X POST http://localhost:8188/auto_disable/restore \
 
 ```json
 {
-  "threshold": 3,
+  "threshold": 30,
   "dry_run": false,
   "exclude": ["comfyui-auto-node-disable", "ComfyUI-Manager"],
   "known_modules": { "...": "..." },
