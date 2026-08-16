@@ -123,23 +123,14 @@ def check_json_syntax() -> list[str]:
     return errors
 
 
-def check_required_api() -> list[str]:
-    """检查 ``auto_disable.py`` 是否仍导出关键符号。"""
-    target = PROJECT_ROOT / "auto_disable.py"
-    if not target.exists():
-        return [f"missing required file: auto_disable.py"]
-
-    try:
-        tree = ast.parse(target.read_text(encoding="utf-8"), filename=str(target))
-    except SyntaxError as e:
-        return [f"auto_disable.py: SyntaxError: {e.msg}"]
-
+def _collect_defined_names(tree: ast.Module) -> tuple[set[str], set[str]]:
+    """从一个已解析的 AST 中提取函数名与赋值名。"""
     defined_funcs = {
         node.name
         for node in ast.walk(tree)
         if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
     }
-    defined_assigns = set()
+    defined_assigns: set[str] = set()
     for node in tree.body:
         if isinstance(node, ast.Assign):
             for t in node.targets:
@@ -147,6 +138,55 @@ def check_required_api() -> list[str]:
                     defined_assigns.add(t.id)
         elif isinstance(node, ast.AnnAssign) and isinstance(node.target, ast.Name):
             defined_assigns.add(node.target.id)
+    return defined_funcs, defined_assigns
+
+
+def _resolve_auto_disable_targets() -> list[Path]:
+    """返回要检查的 auto_disable 源文件。
+
+    - 优先单文件 ``auto_disable.py``；
+    - 若不存在则回退到 package 形式：返回 ``auto_disable/__init__.py``
+      以及同目录下所有子模块 ``_*.py``，覆盖拆分后的形态。
+    """
+    legacy = PROJECT_ROOT / "auto_disable.py"
+    if legacy.exists():
+        return [legacy]
+    pkg_dir = PROJECT_ROOT / "auto_disable"
+    if not pkg_dir.is_dir():
+        return []
+    targets: list[Path] = []
+    init_py = pkg_dir / "__init__.py"
+    if init_py.exists():
+        targets.append(init_py)
+    for sub in sorted(pkg_dir.glob("_*.py")):
+        if sub.name == "__init__.py":
+            continue
+        targets.append(sub)
+    return targets
+
+
+def check_required_api() -> list[str]:
+    """检查 ``auto_disable`` 是否仍导出关键符号。
+
+    支持单文件 ``auto_disable.py`` 或 package 形式
+    ``auto_disable/__init__.py``；后者只检查 ``__init__.py`` 顶层
+    ``__all__`` 与 ``ast.Assign`` 出的名字，因为这是子模块符号对外
+    重新绑定的入口。
+    """
+    targets = _resolve_auto_disable_targets()
+    if not targets:
+        return ["missing required file: auto_disable.py or auto_disable/__init__.py"]
+
+    defined_funcs: set[str] = set()
+    defined_assigns: set[str] = set()
+    for target in targets:
+        try:
+            tree = ast.parse(target.read_text(encoding="utf-8"), filename=str(target))
+        except SyntaxError as e:
+            return [f"{target.relative_to(PROJECT_ROOT)}: SyntaxError: {e.msg}"]
+        f, a = _collect_defined_names(tree)
+        defined_funcs |= f
+        defined_assigns |= a
 
     missing = []
     for name in REQUIRED_AUTO_DISABLE_API:
@@ -154,28 +194,38 @@ def check_required_api() -> list[str]:
             continue
         missing.append(name)
     if missing:
-        return [f"auto_disable.py: missing required symbols: {sorted(missing)}"]
+        return [f"auto_disable: missing required symbols: {sorted(missing)}"]
     return []
 
 
 def check_hot_paths_present() -> list[str]:
-    """热路径（高风险副作用所在函数）必须存在；缺则视为破坏。"""
-    target = PROJECT_ROOT / "auto_disable.py"
-    if not target.exists():
-        return []
-    try:
-        tree = ast.parse(target.read_text(encoding="utf-8"), filename=str(target))
-    except SyntaxError:
-        return []  # 已被语法检查覆盖
+    """热路径（高风险副作用所在函数）必须存在；缺则视为破坏。
 
-    defined_funcs = {
-        node.name
-        for node in ast.walk(tree)
-        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
-    }
-    missing = sorted(REQUIRED_HOT_PATH_NAMES - defined_funcs)
+    同时检查 ``defined_funcs`` 与 ``defined_assigns``，覆盖以下两种场景：
+    - 单文件 ``auto_disable.py``：热路径作为函数定义存在；
+    - package 拆分后：热路径在子模块里以无下划线名定义，再由
+      ``__init__.py`` 通过 ``_decide = _decision.decide`` 形式重新
+      绑定为 ``_decide``，此时它是 ``Assign`` 的 target。
+    """
+    targets = _resolve_auto_disable_targets()
+    if not targets:
+        return []
+
+    defined_funcs: set[str] = set()
+    defined_assigns: set[str] = set()
+    for target in targets:
+        try:
+            tree = ast.parse(target.read_text(encoding="utf-8"), filename=str(target))
+        except SyntaxError:
+            return []  # 已被语法检查覆盖
+        f, a = _collect_defined_names(tree)
+        defined_funcs |= f
+        defined_assigns |= a
+
+    present = defined_funcs | defined_assigns
+    missing = sorted(REQUIRED_HOT_PATH_NAMES - present)
     if missing:
-        return [f"hot-path functions missing in auto_disable.py: {missing}"]
+        return [f"hot-path functions missing in auto_disable: {missing}"]
     return []
 
 
