@@ -347,9 +347,8 @@ def scenario_startup_reconcile() -> None:
 
     # 5b. pending + 原路径已不在 → 应被标记 confirmed
     _reset_state()
-    fake_moved_target = DISABLED_DIR / "module_b"
-    DISABLED_DIR.mkdir(exist_ok=True)
-    fake_moved_target.mkdir()
+    # 模拟“移动已发生但还没来得及写 confirmed”：先把 module_b 移走
+    shutil.move(str(CUSTOM_NODES / "module_b"), str(DISABLED_DIR / "module_b"))
     auto_disable._save_state({
         "threshold": 3,
         "dry_run": False,
