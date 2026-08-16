@@ -114,6 +114,18 @@ def _on_prompt(json_data: dict[str, Any], *args, **kwargs):
         elif (
             isinstance(disabled_count, int)
             and isinstance(known_count, int)
+            and disabled_count > known_count
+        ):
+            # disabled 比 known 多：所有 known 都被禁用，剩余为陈旧条目
+            stale = disabled_count - known_count
+            tail = (
+                f" (all {known_count} known modules disabled; "
+                f"{stale} stale entries from previous installs not in current known_modules; "
+                "use /auto_disable/status to review)"
+            )
+        elif (
+            isinstance(disabled_count, int)
+            and isinstance(known_count, int)
             and disabled_count < known_count
         ):
             remaining = known_count - disabled_count

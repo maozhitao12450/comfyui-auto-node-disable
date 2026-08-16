@@ -535,6 +535,38 @@ class WindowPruningTests(_IsolatedTestBase):
         self.assertEqual(summary["known_count"], 1)
         self.assertEqual(summary["threshold"], 1)
 
+    def test_disabled_exceeds_known_when_stale_entries_exist(self):
+        """``disabled`` 比 ``known`` 多时（陈旧条目），摘要如实反映两者。"""
+        mod_path = self._make_module("kept_mod")
+        s = self._state(threshold=3, rounds=[])
+        # known 1 个，但 disabled 字典里已经预先塞了 3 条陈旧记录
+        s["known_modules"] = {
+            "kept_mod": {"node_classes": ["KeptClass"], "module_path": mod_path},
+        }
+        s["disabled"] = {
+            "old_mod_a": {
+                "original_path": "", "disabled_at": 0.0,
+                "status": "confirmed",
+            },
+            "old_mod_b": {
+                "original_path": "", "disabled_at": 0.0,
+                "status": "confirmed",
+            },
+            "kept_mod": {
+                "original_path": mod_path, "disabled_at": 0.0,
+                "status": "confirmed",
+            },
+        }
+        auto_disable._save_state(s)
+
+        summary = auto_disable.record_prompt(["X"])
+
+        self.assertEqual(summary["known_count"], 1)
+        self.assertEqual(summary["disabled_count"], 3)
+        # 3 > 1，应当是“全部 known 被禁 + 2 条陈旧”
+        self.assertGreater(summary["disabled_count"], summary["known_count"])
+        self.assertEqual(summary["newly_disabled"], [])
+
 
 # ---------------------------------------------------------------------------
 # 5. 刻意构造的失败用例（用于展示测试网格的捕获能力）
