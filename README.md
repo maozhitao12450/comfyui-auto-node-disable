@@ -140,10 +140,10 @@ ComfyUI/
 
 `state["known_modules"]` 记录所有“当前仍可用”的 `custom_node` 模块与它们提供的节点类。它通过以下流程保持同步：
 
-- **启动时一次性扫描**：进程启动时首次 ``_load_state`` 调用会执行一次全量扫描，把结果写入 SQLite；之后 ``record_prompt`` 不再每轮重扫，避免每条 prompt 都遍历 ``NODE_CLASS_MAPPINGS``。
-- **物理 disable 后从 `known_modules` 移除**：模块被搬到 `.disabled/` 后会从 `known_modules` 移除，避免下一轮决策把它再次视为待禁用候选。
-- **自动恢复后回填 `known_modules`**：`restore_for_missing_classes` 触发模块移回 `custom_nodes/` 时会立即把该模块加入 `known_modules`，让下一轮决策能把它当作“已知且当前可用”。
-- **运行时手动刷新**：通过 HTTP API 或 Python 入口调用 ``refresh_known_modules``，可强制重新扫描 ``NODE_CLASS_MAPPINGS``，适配“运行时新装/卸载模块”场景。
+- **每次入队都重扫**：``record_prompt`` 在每次入队时调 ``_scan_known_modules`` 重扫 ``NODE_CLASS_MAPPINGS``，让 ``known_modules`` 与磁盘现状始终保持一致；运行中新装 / 卸载模块不需要额外操作。``_decide`` 只在阈值满足时才触发实际禁用，扫描本身不会产生副作用。
+- **物理 disable 后从 `known_modules` 移除**：模块被搬到 ``.disabled/`` 后会从 ``known_modules`` 移除，避免下一轮决策把它再次视为待禁用候选。
+- **自动恢复后回填 `known_modules`**：``restore_for_missing_classes`` 触发模块移回 ``custom_nodes/`` 时会立即把该模块加入 ``known_modules``，让下一轮决策能把它当作“已知且当前可用”。
+- **运行时手动刷新**（可选）：通过 HTTP API 或 Python 入口调用 ``refresh_known_modules`` 可强制重新扫描，适配调试 / 演示场景。
 
 ---
 

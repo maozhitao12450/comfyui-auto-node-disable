@@ -161,12 +161,6 @@ def _reset_state() -> None:
                 target.unlink()
         shutil.copytree(backup, target)
 
-    # 重置启动一次性扫描标志：_STARTUP_SCAN_DONE 是模块级全局变量，
-    # 跨 scenario 共享。每个 scenario 都应在自己的 _load_state 中触发启动扫描，
-    # 否则后续 scenario 看到的 known_modules 是空、_decide 直接 return，
-    # 验证场景将不再贴合真实启动语义。
-    auto_disable.reset_startup_scan_flag()
-
 
 # ---------------------------------------------------------------------------
 # Scenario 1: 干跑模式只写审计，不动目录
@@ -412,46 +406,60 @@ def scenario_known_modules_sync() -> None:
     auto_disable.set_threshold(2)
     auto_disable.set_dry_run(False)
 
-    # 1) 验证启动一次性扫描：监控 _fake_scan 调用次数。
-    # 跨 scenario 共享进程，_STARTUP_SCAN_DONE 可能已被前序 scenario 置 True；
-    # 这里重置以观察“本场景内的多次 _load_state 是否只触发一次扫描”。
-    auto_disable.reset_startup_scan_flag()
-    auto_disable._scan_known_modules = _fake_scan  # type: ignore[assignment]
+    # 动态 scan：返回“磁盘上仍在 custom_nodes/ 下的模块”，
+    # 与 _fake_scan 始终返回 module_a/module_b 不同，
+    # 这样能验证“物理 disable 后从 known_modules 移除”的真语义。
+    def disk_aware_scan(state):
+        result = {}
+        for name in ("module_a", "module_b"):
+            disabled_path = DISABLED_DIR / name
+            if disabled_path.exists():
+                continue
+            live_path = CUSTOM_NODES / name
+            if not live_path.exists():
+                continue
+            result[name] = {
+                "node_classes": ["ClassA" if name == "module_a" else "ClassB"],
+                "module_path": str(live_path),
+            }
+        state["known_modules"] = result
+        return result
 
+    auto_disable._scan_known_modules = disk_aware_scan  # type: ignore[assignment]
+
+    # 1) 验证“每次 record_prompt 都重扫”：计数 _scan_known_modules 调用次数。
+    # 用 threshold=99 暂时让任何 disable 都不会被触发，确保前 3 个
+    # record_prompt 调用期间模块始终留在 known_modules / custom_nodes/。
     scan_calls = {"count": 0}
 
     def counting_scan(state):
         scan_calls["count"] += 1
-        return _fake_scan(state)
+        return disk_aware_scan(state)
 
     auto_disable._scan_known_modules = counting_scan  # type: ignore[assignment]
-    # 连续多次 _load_state：只应扫描一次
-    auto_disable._load_state()
-    auto_disable._load_state()
-    auto_disable._load_state()
+    auto_disable.set_threshold(99)
+    # 每次入队都同时引用 ClassA 与 ClassB，确保两个模块都被视作"被使用过"，
+    # 在 threshold=99 下不会触发任何 disable，让前 3 次 record_prompt 期间
+    # 模块始终留在 known_modules 与 custom_nodes/，便于单独验证"每次扫描"。
+    for i in range(1, 4):
+        auto_disable.record_prompt(["ClassA", "ClassB"], prompt_id=f"p-sync-{i}")
     _assert(
-        scan_calls["count"] == 1,
-        f"startup scan should fire exactly once per process, got {scan_calls['count']}",
+        scan_calls["count"] == 3,
+        f"every record_prompt should rescan known_modules, got {scan_calls['count']} scans",
     )
 
-    # 2) 验证启动扫描结果落盘：known_modules 含两个候选模块
+    # 2) 扫描结果：known_modules 含两个候选模块（threshold=99 时不会被禁用）
     snap = auto_disable.snapshot()
     _assert(
         set(snap["known_modules"].keys()) == {"module_a", "module_b"},
-        f"after startup scan, known_modules should contain module_a/module_b, "
+        f"known_modules should contain module_a/module_b, "
         f"got {set(snap['known_modules'].keys())}",
     )
 
-    # 3) 物理 disable 后 known_modules 应移除该模块
-    auto_disable.record_prompt({"prompt": {"1": {"class_type": "ClassA"}}}, prompt_id="p-sync-1")
-    auto_disable.record_prompt(["OtherClass"], prompt_id="p-sync-2")
-    # 第 3 轮触发 module_a 禁用（threshold=2 时 recent=[OtherClass, ClassA],
-    # 但 _decide 看 module_a 的 node_classes=[ClassA] 与 used_union={ClassA, OtherClass}
-    # 有交集，不会禁用。要让 module_a 禁用，需要 recent 不含 ClassA）
-    # 用 None 作为本轮的 used，跳过 _decide 决策
-    # 重新做：threshold=1，让第 2 轮（不含 ClassA）就能触发 module_a 禁用
+    # 3) 物理 disable 后 known_modules 应移除该模块：
+    # 把 threshold 降到 1，再用不引用 ClassA/ClassB 的提示触发决策。
     auto_disable.set_threshold(1)
-    auto_disable.record_prompt(["OtherClass"], prompt_id="p-sync-3")
+    auto_disable.record_prompt(["OtherClass"], prompt_id="p-sync-3b")
     auto_disable.record_prompt(["AnotherClass"], prompt_id="p-sync-4")
 
     snap = auto_disable.snapshot()
@@ -469,11 +477,9 @@ def scenario_known_modules_sync() -> None:
     )
 
     # 4) restore_for_missing_classes 后 known_modules 应回填该模块
-    # 模拟当前 NODE_CLASS_MAPPINGS 不含 ClassA → trigger 自动恢复
     real_registered = auto_disable._current_registered_classes
     auto_disable._current_registered_classes = lambda: {"OtherClass"}  # type: ignore[assignment]
     try:
-        # 用 ClassA 触发 restore
         auto_disable.record_prompt({"prompt": {"1": {"class_type": "ClassA"}}}, prompt_id="p-sync-5")
     finally:
         auto_disable._current_registered_classes = real_registered  # type: ignore[assignment]
@@ -498,11 +504,11 @@ def scenario_refresh_known_modules() -> None:
     auto_disable.set_threshold(3)
     auto_disable.set_dry_run(False)
 
-    # 1) 第一次 _load_state 用默认 _fake_scan 建立 known_modules。
-    # 重置标志使本次 _load_state 能真正执行启动扫描（前序 scenario 可能已置 True）。
-    auto_disable.reset_startup_scan_flag()
+    # 1) 用 _fake_scan 通过 refresh_known_modules 建立 known_modules。
+    # 这里用 refresh 而不是 record_prompt，避免被 Scenario 6 设置的
+    # disk_aware_scan 覆盖扫描逻辑。
     auto_disable._scan_known_modules = _fake_scan  # type: ignore[assignment]
-    auto_disable._load_state()
+    auto_disable.refresh_known_modules()
     snap = auto_disable.snapshot()
     _assert(
         set(snap["known_modules"].keys()) == {"module_a", "module_b"},
